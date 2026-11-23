@@ -57,7 +57,7 @@ def _help(chat, arg):
             line += " (also " + ", ".join("/" + a for a in command.aliases) + ")"
         lines.append(line)
     lines += ["", "Tab completes a command. Start a message with // to send it with one leading /.",
-              "Keys: Enter send · Tab complete · Ctrl-U clear the line · F2 model · F3 reply length · "
+              "Keys: Enter send · Tab complete · Ctrl-U clear the line · F2 model · F3 reply length · F4 show denoising · "
               "Ctrl-N new chat · PgUp/PgDn scroll · Esc stop · F10 or Ctrl-Q quit"]
     chat.show("Commands", lines)
 
@@ -153,6 +153,19 @@ def _save(chat, arg):
     chat.status = f"Saved the chat to {target}."
 
 
+def _visual(chat, arg):
+    word = arg.lower()
+    if word not in ("", "on", "off"):
+        raise ValueError("Use /visual on or /visual off.")
+    chat.visual = (not chat.visual) if not word else word == "on"
+    if chat.visual:
+        chat.status = "Replies show as they arrive; a diffusion reply shows each denoising step, ░ for masked tokens."
+    else:
+        chat.status = "Replies show only when finished."
+    if chat.busy:
+        chat.status += " From the next reply."
+
+
 def _retry(chat, arg):
     if not chat.messages or chat.messages[-1]["role"] != "assistant":
         raise ValueError("There is no reply to retry.")
@@ -193,6 +206,8 @@ COMMANDS = (
     Command("length", "[N]", f"set the reply length in tokens ({MIN_LENGTH}-{MAX_LENGTH})", _length),
     Command("steps", "[N|auto]", "set the diffusion steps per reply", _steps, choices=("auto",)),
     Command("device", "[NAME|auto]", "set the llama.cpp device, for example Vulkan1", _device, choices=("auto",)),
+    Command("visual", "[on|off]", "show replies as they denoise or stream (on; F4 toggles)", _visual,
+            ("diffusion",), choices=("on", "off")),
     Command("retry", "", "ask for the last reply again", _retry, idle=True),
     Command("undo", "", "take back the last exchange", _undo, idle=True),
     Command("save", "[FILE]", "write the chat as Markdown", _save),

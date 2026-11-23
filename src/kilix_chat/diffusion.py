@@ -28,6 +28,9 @@ TEMPLATE_TOKENS = 64
 CLEAR = "\x1b[2J\x1b[H"
 END_MARKERS = ("<|im_end|>", "<|eot_id|>", "<|endoftext|>", "<|end_of_text|>", "<|eos|>")
 _STEP = re.compile(r"diffusion step: (\d+)/(\d+)")
+# How the window draws a token that is still masked.
+MASK = "░"
+_SPACES = re.compile(r" +")
 
 
 def model_folders():
@@ -107,6 +110,21 @@ def latest_frame(log):
             # The timing line follows the last frame before the final clear.
             return int(match[1]), int(match[2]), body[:-1].split("\ntotal time: ")[0].rstrip("\n")
     return None
+
+
+def show_masks(frame, glyph=MASK):
+    """Draw the masked tokens of a visual frame as `glyph`.
+
+    llama-diffusion-cli prints a masked token as one space, so a frame early
+    in a reply is blank. A run of spaces before a word keeps one space, the
+    word's own; every other space in the run is a mask. Indentation is drawn
+    as masks until the reply is finished, which then shows as written.
+    """
+    def run(match):
+        spaces = len(match.group(0))
+        word_follows = match.end() < len(frame) and frame[match.end()] != "\n"
+        return glyph * (spaces - 1) + " " if word_follows else glyph * spaces
+    return _SPACES.sub(run, frame)
 
 
 @dataclass

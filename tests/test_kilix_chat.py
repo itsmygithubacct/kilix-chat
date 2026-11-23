@@ -574,6 +574,40 @@ class CommandTest(Fixture):
         saved = list((self.root / "data/kilix-chat/chats").glob("chat-*.md"))
         self.assertEqual([p.read_text() for p in saved], [text])
 
+    def test_denoising_shows_masks_by_default_and_can_be_hidden(self):
+        # Frames as llama-diffusion-cli writes them: one space per masked token.
+        self.assertEqual(diffusion.show_masks("    "), "░░░░")
+        self.assertEqual(diffusion.show_masks(" The sea stretches   the     ."), " The sea stretches░░ the░░░░ .")
+        self.assertEqual(diffusion.show_masks("horizon.  \nIt   with"), "horizon.░░\nIt░░ with")
+        os.environ["CHAT_REPLY"] = "abcdefgh"
+        chat = self.chat()
+        seen = []
+        progress = chat._progress
+        def spy(*args):
+            progress(*args)
+            seen.append(chat.partial)
+        chat._progress = spy
+        self.assertTrue(chat.visual)
+        self.enter(chat, "one")
+        self.assertIn("--diffusion-visual", self.runs()[-1][0])
+        # The window polls, so it may see only some frames; the last is always shown.
+        self.assertEqual(seen[-1], ("abcdefg░", "(step 127/128)"))
+        self.assertTrue(all(len(text) == 8 and text.endswith("░") for text, _ in seen))
+        self.assertEqual(chat.messages[-1]["content"], "abcdefgh")
+        chat.entry = "half typed"
+        tui.handle(chat, tui.curses.KEY_F4)
+        self.assertEqual((chat.visual, chat.entry), (False, "half typed"))
+        seen.clear()
+        self.enter(chat, "two")
+        self.assertNotIn("--diffusion-visual", self.runs()[-1][0])
+        self.assertEqual((seen, chat.messages[-1]["content"]), ([], "abcdefgh"))
+        self.enter(chat, "/visual sideways")
+        self.assertIn("Use /visual on or /visual off.", chat.status)
+        self.enter(chat, "/visual on")
+        self.assertTrue(chat.visual)
+        self.enter(chat, "/diffusion off")
+        self.assertFalse(chat.visual)
+
     def test_help_completion_and_the_hint_line(self):
         chat = self.chat()
         self.enter(chat, "/help")
@@ -581,7 +615,7 @@ class CommandTest(Fixture):
         text = "\n".join(lines)
         self.assertEqual(title, "Commands")
         for name in ("quit", "exit", "model", "context", "memory", "clear", "new", "system", "length", "steps",
-                     "save", "help", "retry", "undo", "device"):
+                     "save", "help", "retry", "undo", "device", "visual", "diffusion"):
             self.assertIn("/" + name, text)
         self.assertIn("F2 model", text)
         for typed, completed in (("/mo", "/model "), ("/s", "/s"), ("/st", "/steps "), ("/re", "/re"),

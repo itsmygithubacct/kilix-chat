@@ -11,11 +11,12 @@ import threading
 import textwrap
 
 from kilix_chat import commands, memory
-from kilix_chat.diffusion import Cancelled
+from kilix_chat.diffusion import Cancelled, show_masks
 from kilix_chat.models import catalog, load
 
 LENGTHS = (64, 128, 256, 512)
-HELP = "Enter send · /help commands · F2 model · F3 reply length · Ctrl-N new chat · Esc stop · F10 quit"
+HELP = ("Enter send · /help commands · F2 model · F3 reply length · F4 show denoising · Ctrl-N new chat · "
+        "Esc stop · F10 quit")
 ENTRY = "Enter a GGUF path or ollama:NAME..."
 
 
@@ -68,6 +69,7 @@ class Chat:
         self.system = ""
         self.info = None
         self.activity = ""
+        self.visual = True
         self.worker = None
         self.cancel = threading.Event()
         self.lock = threading.Lock()
@@ -155,13 +157,16 @@ class Chat:
         self.background(lambda: self._reply(history), "Generating… Esc stops.")
 
     def _progress(self, text, step, steps):
+        if step is not None:
+            text = show_masks(text)
         with self.lock:
             self.partial = (text, f"(step {step}/{steps})" if step is not None else "")
 
     def _reply(self, history):
         try:
             reply, _ = self.model.reply(history, max_tokens=self.length, steps=self.steps,
-                                        on_partial=self._progress, cancel=self.cancel)
+                                        on_partial=self._progress if self.visual else None,
+                                        cancel=self.cancel)
         except Cancelled:
             with self.lock:
                 self.partial = None
@@ -293,6 +298,9 @@ def handle(chat, key):
         return True
     if key == curses.KEY_F2 and not chat.busy:
         chat.open_picker()
+        return True
+    if key == curses.KEY_F4:
+        commands.lookup("visual").run(chat, "")
         return True
     if key == curses.KEY_F3:
         chat.length = next_length(chat.length)

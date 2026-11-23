@@ -4,7 +4,8 @@ Chat with a local model in the terminal. kilix-chat runs text diffusion
 models (LLaDA, LLaDA-MoE, Dream, DiffuCoder, RND1) through llama.cpp's
 `llama-diffusion-cli`, and ordinary models through a local Ollama daemon.
 A diffusion reply appears all at once and sharpens step by step as it
-denoises, rather than growing word by word.
+denoises, rather than growing word by word: the window draws every token
+that is still masked as `░`, and words settle into place among them.
 
 ```sh
 ./kilix-chat                                   # pick a model, then chat
@@ -26,6 +27,7 @@ It needs Python 3.11 or newer and nothing else from PyPI.
 | Ctrl-U | Clear the entry line |
 | F2 | Choose a model |
 | F3 | Cycle the reply length: 64, 128, 256 or 512 tokens |
+| F4 | Show or hide replies as they denoise or stream (shown by default) |
 | Ctrl-N | Start a new chat |
 | PgUp / PgDn | Scroll the conversation |
 | Esc | Stop the reply in progress (the unanswered message is taken back), or close a command's output |
@@ -48,6 +50,7 @@ Start a message with `//` to send it with a single leading `/`.
 | `/system [TEXT]` | Show or set the system prompt (`/system clear` removes it) |
 | `/length [N]` | Show or set the reply length, 8 to 16384 tokens |
 | `/steps [N]` | Show or set the diffusion steps per reply (`/steps auto`: half the reply length) |
+| `/visual [on\|off]` (`/diffusion`) | Show replies as they denoise or stream, or only when finished; with no word it toggles, like F4 |
 | `/device [NAME]` | Show or set the llama.cpp device, for example `Vulkan1` (`/device auto`: llama.cpp chooses) |
 | `/retry` | Ask for the last reply again |
 | `/undo` | Take back the last exchange and put your message back in the entry |
@@ -57,8 +60,18 @@ Start a message with `//` to send it with a single leading `/`.
 
 `/model`, `/context`, `/retry`, `/undo` and `/clear` wait until the reply
 in progress finishes or is stopped. The other commands work during a reply,
-and a new length, step count, device or system prompt applies from the next
-reply.
+and a new length, step count, device, display or system prompt applies from
+the next reply.
+
+### Watching a reply denoise
+
+llama-diffusion-cli prints a masked token as one space, so kilix-chat draws
+each run of spaces as masks, keeping one space before a word for the word
+itself. Indentation therefore looks masked until the reply is finished, and
+the finished reply is shown exactly as the model wrote it. The sequence is as
+long as the reply length, and most of it ends up as end-of-text padding,
+which LLaDA unmasks first, so the masks shrink for most of the steps before
+the words arrive. A shorter `/length` gets to the words sooner.
 
 ### Memory
 

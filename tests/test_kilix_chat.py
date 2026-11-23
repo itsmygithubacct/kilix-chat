@@ -49,6 +49,10 @@ def entry(text):
     for stream in filter(None, (sys.stderr, log)):
         stream.write(prefix + text)
         stream.flush()
+if os.environ.get('CHAT_FAIL') == 'memory':
+    entry('alloc_tensor_range: failed to allocate Vulkan1 buffer of size 1054838784\n')
+    entry('error: failed to load model\n')
+    sys.exit(1)
 if os.environ.get('CHAT_FAIL'):
     entry('error: failed to load model\n')
     sys.exit(1)
@@ -183,6 +187,10 @@ class DiffusionTest(Fixture):
     def test_failures_report_llama_cpp_and_not_the_driver(self):
         os.environ["CHAT_FAIL"] = "1"
         with self.assertRaisesRegex(RuntimeError, r"^llama-diffusion-cli exited 1\. error: failed to load model$"):
+            self.model().reply([{"role": "user", "content": "x"}])
+        os.environ["CHAT_FAIL"] = "memory"
+        with self.assertRaisesRegex(RuntimeError, r"^There is not enough free GPU memory for dream coder\.gguf\. "
+                                                  r"Another model may be loaded \(see `ollama ps`\)\.$"):
             self.model().reply([{"role": "user", "content": "x"}])
 
     def test_long_conversations_drop_their_oldest_turns(self):

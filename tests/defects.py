@@ -52,6 +52,9 @@ DEFECTS = [
     ("a failed reply leaves the unanswered message",
      S + "tui.py", "                self.partial = None\n                self.messages.pop()\n                self.status = f\"No reply: {error}\"",
      "                self.partial = None\n                self.status = f\"No reply: {error}\""),
+    ("a full GPU is reported as an opaque load failure",
+     S + "diffusion.py", 'if "failed to allocate" in output or "unable to allocate" in output:',
+     'if False:'),
     ("F3 does not change the reply length",
      S + "tui.py", "chat.length = LENGTHS[(LENGTHS.index(chat.length) + 1) % len(LENGTHS)]", "pass"),
 ]

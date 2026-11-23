@@ -207,6 +207,9 @@ class DiffusionModel:
                     on_frame(*frame)
             text = final_reply(output, visual)
             if process.returncode != 0 or text is None:
+                if "failed to allocate" in output or "unable to allocate" in output:
+                    raise RuntimeError(f"There is not enough free GPU memory for {self.path.name}. "
+                                       "Another model may be loaded (see `ollama ps`).")
                 lines = [line for line in (output or stderr).strip().splitlines() if line.strip()]
                 raise RuntimeError(f"llama-diffusion-cli exited {process.returncode}. "
                                    + (lines[-1][:300] if lines else ""))

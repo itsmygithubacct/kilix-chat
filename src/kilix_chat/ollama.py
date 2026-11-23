@@ -9,6 +9,13 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 from kilix_chat.diffusion import Cancelled, Reply
+from kilix_chat.prompt import text_of
+
+# Without a tokenizer, a token is taken to be four bytes of UTF-8, and every
+# message adds a few tokens of chat template around its text.
+BYTES_PER_TOKEN = 4
+MESSAGE_TOKENS = 4
+DEFAULT_CONTEXT = 4096
 
 
 def base_url():
@@ -33,11 +40,48 @@ def local_models(timeout=2):
         return []
 
 
+def _get(path, timeout):
+    with urlopen(base_url() + path, timeout=timeout) as response:
+        return json.load(response)
+
+
+def estimate(messages):
+    """Estimated prompt tokens for `messages`."""
+    total = 0
+    for message in messages:
+        size = len(text_of(message.get("content")).encode("utf-8"))
+        total += -(-size // BYTES_PER_TOKEN) + MESSAGE_TOKENS
+    return total
+
+
 class OllamaModel:
     architecture = "ollama"
 
     def __init__(self, name):
         self.name = name
+
+    def context_length(self, timeout=3):
+        """(tokens, where the number comes from) for this model's context window."""
+        try:
+            for row in _get("/api/ps", timeout).get("models", []):
+                if self.name in (row.get("name"), row.get("model")) and isinstance(row.get("context_length"), int):
+                    return row["context_length"], "the window Ollama has it loaded with"
+        except (OSError, URLError, ValueError, AttributeError):
+            pass
+        try:
+            with _post("/api/show", {"model": self.name}, timeout) as response:
+                shown = json.load(response)
+        except (OSError, URLError, ValueError):
+            return DEFAULT_CONTEXT, "Ollama did not answer, so this is a guess"
+        for line in (shown.get("parameters") or "").splitlines():
+            key, _, value = line.partition(" ")
+            if key == "num_ctx" and value.strip().isdigit():
+                return int(value.strip()), "num_ctx in the model's parameters"
+        info = shown.get("model_info") or {}
+        value = info.get(f"{info.get('general.architecture')}.context_length")
+        if isinstance(value, int) and value > 0:
+            return value, "the model's trained length; Ollama may load it with a smaller num_ctx"
+        return DEFAULT_CONTEXT, "Ollama did not say, so this is a guess"
 
     def chat(self, messages, *, max_tokens=256, on_text=None, cancel=None):
         body = {"model": self.name, "messages": messages, "stream": True, "think": False,

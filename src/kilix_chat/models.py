@@ -1,6 +1,7 @@
 """One interface over diffusion GGUFs and Ollama models."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 from kilix_chat import diffusion, ollama, prompt
@@ -13,6 +14,44 @@ def catalog():
     rows = [(path, f"{Path(path).name}  [{kind}]") for path, kind in diffusion.local_models()]
     rows += [(OLLAMA_PREFIX + name, f"{name}  [ollama]") for name in ollama.local_models()]
     return rows
+
+
+def load(spec, *, device=None):
+    """Open the model `spec` names: a diffusion GGUF path, or ollama:NAME.
+
+    Every part of kilix-chat opens models here, so this is the seam for
+    anything that must know which model is about to use the GPU. A diffusion
+    model's weights reach the GPU only for the length of one reply, in
+    DiffusionModel.generate.
+    """
+    return Model(spec, device=device)
+
+
+def oldest_turn(history):
+    """Index of the turn to drop when a conversation is too long, or None.
+
+    System messages stay, and so does the newest turn: without it there is
+    nothing to reply to.
+    """
+    first = next((i for i, m in enumerate(history) if m.get("role") not in ("system", "developer")), None)
+    return None if first is None or first == len(history) - 1 else first
+
+
+@dataclass
+class Budget:
+    """How a conversation fits the model's context."""
+    prompt_tokens: int      # the conversation as it would be sent, after dropping
+    full_tokens: int        # the whole conversation, before dropping
+    context: int            # the model's context length, in tokens
+    reply_tokens: int       # the reply length reserved after the prompt
+    turns: int              # turns (messages other than system ones) in the conversation
+    dropped: int            # the oldest turns that would be left out to fit
+    exact: bool             # counted by the model's tokenizer, not estimated
+    note: str = ""
+
+    @property
+    def fits(self):
+        return self.prompt_tokens + self.reply_tokens <= self.context
 
 
 class Model:
@@ -46,10 +85,39 @@ class Model:
                 break
             except ValueError as error:
                 # Drop the oldest non-system turn until the conversation fits.
-                first = next((i for i, m in enumerate(history) if m.get("role") not in ("system", "developer")), None)
-                if "holds" not in str(error) or first is None or first == len(history) - 1:
+                first = oldest_turn(history)
+                if "holds" not in str(error) or first is None:
                     raise
                 del history[first]
         content, calls = prompt.tool_calls(result.text, tools)
         result.text = content
         return result, calls
+
+    def budget(self, messages, *, tools=None, max_tokens=256):
+        """Budget for sending `messages` with a reply of `max_tokens`.
+
+        It follows the same rule as reply: the oldest turns go, one at a time,
+        until the prompt and the reply fit. Ollama trims an overlong prompt the
+        same way, so its numbers are estimates of what Ollama will do.
+        """
+        if self.diffusion:
+            context, exact, note = self.backend.context, self.backend.exact_counts(), ""
+            def count(history):
+                system, user = prompt.flatten(history, tools)
+                return self.backend.prompt_tokens(system, user)
+        else:
+            context, note = self.backend.context_length()
+            exact = False
+            count = ollama.estimate
+        history = list(messages)
+        turns = sum(1 for m in history if m.get("role") not in ("system", "developer"))
+        full = tokens = count(history)
+        dropped = 0
+        while tokens + max_tokens > context:
+            first = oldest_turn(history)
+            if first is None:
+                break
+            del history[first]
+            dropped += 1
+            tokens = count(history)
+        return Budget(tokens, full, context, max_tokens, turns, dropped, exact, note)

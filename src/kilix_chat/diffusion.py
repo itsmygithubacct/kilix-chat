@@ -139,10 +139,20 @@ class DiffusionModel:
         self.env = {**os.environ, "LD_LIBRARY_PATH": os.pathsep.join(filter(None, (
             str(self.binary.parent), os.environ.get("LD_LIBRARY_PATH"))))}
 
+    def exact_counts(self):
+        """True when a sibling llama-tokenize counts tokens exactly."""
+        counter = self.binary.with_name("llama-tokenize")
+        return counter.is_file() and os.access(counter, os.X_OK)
+
+    def prompt_tokens(self, system, prompt):
+        """Tokens the prompt takes in the sequence, chat template included."""
+        with tempfile.TemporaryDirectory(prefix="kilix-chat-") as folder:
+            return self.count(system + "\n" + prompt, Path(folder)) + TEMPLATE_TOKENS
+
     def count(self, text, scratch):
         """Count with the sibling llama-tokenize, or bound it by the UTF-8 length."""
         counter = self.binary.with_name("llama-tokenize")
-        if counter.is_file() and os.access(counter, os.X_OK):
+        if self.exact_counts():
             source = scratch / "count.txt"
             source.write_text(text, encoding="utf-8")
             result = subprocess.run([str(counter), "-m", str(self.path), "-f", str(source), "--show-count",

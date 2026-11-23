@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """kilix-chat offline: GGUF metadata, prompts, tool calls, the diffusion
-runner against a stand-in llama-diffusion-cli, the server, Ollama and the
-chat window's key handling."""
+runner against a stand-in llama-diffusion-cli, the server, Ollama, and the
+chat window's keys, slash commands and memory."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -17,7 +17,7 @@ from urllib.request import Request, urlopen
 
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "src"))
-from kilix_chat import diffusion, gguf, models, ollama, prompt, server, tui  # noqa: E402
+from kilix_chat import commands, diffusion, gguf, memory, models, ollama, prompt, server, tui  # noqa: E402
 
 
 def gguf_bytes(arch, name="Tiny", context=None, extra=()):
@@ -95,7 +95,8 @@ class Fixture(unittest.TestCase):
         self.calls = self.root / "calls"
         env = {"KILIX_CHAT_MODELS": str(self.models), "CHAT_CALLS": str(self.calls), "PATH": "/usr/bin:/bin",
                "KILIX_CHAT_DIFFUSION_CLI": "", "PUZZLLM_DIFFUSION_CLI": "", "KILIX_CHAT_DEVICE": "",
-               "PUZZLLM_GPU": "", "OLLAMA_HOST": "127.0.0.1:9", "CHAT_REPLY": "", "CHAT_FAIL": ""}
+               "PUZZLLM_GPU": "", "OLLAMA_HOST": "127.0.0.1:9", "CHAT_REPLY": "", "CHAT_FAIL": "",
+               "XDG_DATA_HOME": str(self.root / "data")}
         patcher = patch.dict(os.environ, env)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -361,6 +362,291 @@ class WindowTest(Fixture):
         refused = subprocess.run([launcher], capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL)
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn("needs a terminal", refused.stderr)
+
+
+WORD_COUNTER = "#!/bin/sh\nwc -c < \"$4\" | sed 's/^/Total number of tokens: /'\n"
+
+
+class Screen:
+    """Enough of a curses window to draw into and read back."""
+    def __init__(self, height=20, width=100):
+        self.size, self.rows = (height, width), {}
+    def getmaxyx(self):
+        return self.size
+    def erase(self):
+        self.rows = {}
+    def addnstr(self, y, x, text, n, attr=0):
+        self.rows[y] = text[:n]
+    def move(self, y, x):
+        pass
+
+
+class CommandTest(Fixture):
+    def chat(self, **kwargs):
+        return tui.Chat(str(self.dream), **kwargs)
+
+    def enter(self, chat, line):
+        """Type a line and press Enter. Return what handle returned."""
+        chat.entry = line
+        result = tui.handle(chat, "\n")
+        if chat.worker:
+            chat.worker.join(10)
+        return result
+
+    def test_quit_and_exit_leave_and_unknown_commands_never_reach_the_model(self):
+        chat = self.chat()
+        for line in ("/quit", "/exit", "/Q", " /exit "):
+            self.assertFalse(self.enter(chat, line), line)
+        self.assertTrue(self.enter(chat, "/frobnicate now"))
+        self.assertIn("Unknown command /frobnicate. /help lists the commands.", chat.status)
+        self.assertEqual(chat.entry, "/frobnicate now")
+        tui.handle(chat, "\x15")
+        self.assertEqual(chat.entry, "")
+        self.assertEqual((chat.messages, self.runs()), ([], []))
+        self.enter(chat, "//etc/hosts lists hosts")
+        self.assertEqual(chat.messages[0], {"role": "user", "content": "/etc/hosts lists hosts"})
+        self.assertEqual(self.runs()[0][2], "/etc/hosts lists hosts")
+
+    def test_model_opens_the_picker_or_switches_to_the_named_model(self):
+        other = self.models / "llada.gguf"
+        other.write_bytes(gguf_bytes("llada", "LLaDA Small", 4096))
+        chat = self.chat()
+        chat.messages = [{"role": "user", "content": "old"}]
+        self.enter(chat, "/model")
+        self.assertTrue(chat.picking)
+        tui.handle(chat, "\x1b")
+        self.assertFalse(chat.picking)
+        self.enter(chat, f"/model {other}")
+        self.assertEqual((chat.model.name, chat.messages, chat.picking), ("LLaDA Small", [], False))
+        self.assertIn("Chatting with LLaDA Small", chat.status)
+        self.enter(chat, "/model /no/such.gguf")
+        self.assertEqual(chat.model.name, "LLaDA Small")
+        self.assertIn("Could not open the model", chat.status)
+
+    def test_commands_that_change_the_chat_wait_for_the_reply(self):
+        chat = self.chat()
+        chat.messages = [{"role": "user", "content": "keep"}]
+        hold = threading.Event()
+        chat.worker = threading.Thread(target=hold.wait, daemon=True)
+        chat.worker.start()
+        self.addCleanup(hold.set)
+        for line in ("/clear", "/new", "/retry", "/context"):
+            chat.entry = line
+            tui.handle(chat, "\n")
+            self.assertIn("waits for the reply", chat.status)
+        self.assertEqual(chat.messages, [{"role": "user", "content": "keep"}])
+        chat.entry = "/length 64"
+        tui.handle(chat, "\n")
+        self.assertEqual(chat.length, 64)
+
+    def test_context_counts_the_prompt_the_reply_and_the_dropped_turns(self):
+        self.counter.write_text(WORD_COUNTER)
+        memory.add("Call me Sam.")
+        chat = self.chat()
+        chat.system = "Be brief."
+        for n in range(30):
+            chat.messages += [{"role": "user", "content": f"question {n} " + "x" * 80},
+                              {"role": "assistant", "content": "answer " + "y" * 80}]
+        def tokens(history):
+            system, user = prompt.flatten(history)
+            return len((system + "\n" + user).encode()) + diffusion.TEMPLATE_TOKENS
+        history = chat.conversation()
+        self.assertEqual(history[0]["content"], "Be brief.\n\n" + memory.HEADER + "\n- Call me Sam.")
+        full, dropped = tokens(history), 0
+        while tokens(history) + 256 > 2048:
+            del history[1]
+            dropped += 1
+        self.assertGreater(dropped, 1)
+        self.enter(chat, "/context")
+        title, lines = chat.info
+        self.assertEqual(title, "Context")
+        self.assertEqual(lines, [
+            "Context   2,048 tokens",
+            f"Prompt    {tokens(history):,} tokens, counted by llama-tokenize; system prompt and memory included",
+            "Reply     256 tokens reserved (/length)",
+            f"Free      {2048 - 256 - tokens(history):,} tokens",
+            f"Turns     60 in this chat; the oldest {dropped} would be dropped (the whole chat needs {full:,} tokens)"])
+        chat.messages = chat.messages[-2:]
+        self.enter(chat, "/length 64")
+        self.enter(chat, "/context")
+        self.assertIn(f"Prompt    {tokens(chat.conversation()):,} tokens", chat.info[1][1])
+        self.assertEqual(chat.info[1][2:], ["Reply     64 tokens reserved (/length)",
+                                            f"Free      {2048 - 64 - tokens(chat.conversation()):,} tokens",
+                                            "Turns     2 in this chat; none would be dropped"])
+        chat.messages = [{"role": "user", "content": "z" * 3000}]
+        self.enter(chat, "/context")
+        self.assertEqual(chat.info[1][-1], "Even the newest turn does not fit: shorten it, or the reply with /length.")
+        tui.handle(chat, "\x1b")
+        self.assertIsNone(chat.info)
+
+    def test_memory_is_kept_across_chats_and_joins_the_system_prompt(self):
+        chat = self.chat()
+        self.enter(chat, "/memory add The cat is   called Miso.")
+        self.enter(chat, "/remember Use metric units")
+        self.assertEqual((self.root / "data/kilix-chat/memory.md").read_text(),
+                         "- The cat is called Miso.\n- Use metric units\n")
+        fresh = self.chat()
+        self.enter(fresh, "/memory")
+        self.assertEqual(fresh.info[1][:2], ["1. The cat is called Miso.", "2. Use metric units"])
+        self.enter(fresh, "/system Be terse.")
+        self.enter(fresh, "hello")
+        self.assertEqual(self.runs()[-1][1], "Be terse.\n\n" + memory.HEADER
+                         + "\n- The cat is called Miso.\n- Use metric units")
+        self.enter(fresh, "/memory forget 1")
+        self.assertEqual(memory.notes(), ["Use metric units"])
+        self.enter(fresh, "/memory forget 9")
+        self.assertIn("There is no note 9", fresh.status)
+        self.enter(fresh, "/memory clear")
+        self.assertEqual(memory.notes(), [])
+        self.assertIn("Forgot 1 note.", fresh.status)
+        self.enter(fresh, "/memory add   ")
+        self.assertEqual(memory.notes(), [])
+        self.assertIn("Say what to remember", fresh.status)
+        self.enter(fresh, "again")
+        self.assertEqual(self.runs()[-1][1], "Be terse.")
+
+    def test_new_chat_and_system_prompt(self):
+        chat = self.chat()
+        for line in ("/new", "/clear"):
+            chat.messages = [{"role": "user", "content": "x"}]
+            self.enter(chat, line)
+            self.assertEqual(chat.messages, [], line)
+        self.enter(chat, "/system You are a pirate.")
+        self.enter(chat, "/system")
+        self.assertEqual(chat.info, ("System prompt", ["You are a pirate."]))
+        self.enter(chat, "hi")
+        self.assertEqual(self.runs()[-1][1], "You are a pirate.")
+        self.enter(chat, "/system clear")
+        self.enter(chat, "hi")
+        self.assertEqual(self.runs()[-1][1], "")
+        self.assertNotIn("-sys", self.runs()[-1][0])
+
+    def test_length_and_steps_reach_llama_diffusion_cli(self):
+        chat = self.chat()
+        self.enter(chat, "/length 40")
+        self.enter(chat, "/steps 5")
+        for line in ("/length 3", "/length many", "/steps 0"):
+            self.enter(chat, line)
+        self.assertEqual((chat.length, chat.steps), (40, 5))
+        self.assertIn("from 1 to 4096", chat.status)
+        self.enter(chat, "one")
+        option = lambda name: self.runs()[-1][0][self.runs()[-1][0].index(name) + 1]
+        self.assertEqual((option("-ub"), option("--diffusion-steps")), (str(7 + 64 + 40), "5"))
+        self.enter(chat, "/steps auto")
+        self.enter(chat, "two")
+        self.assertEqual(option("--diffusion-steps"), "20")
+        for start, after in ((40, 64), (256, 512), (512, 64), (600, 64)):
+            chat.length = start
+            tui.handle(chat, tui.curses.KEY_F3)
+            self.assertEqual(chat.length, after, start)
+
+    def test_retry_undo_and_device(self):
+        chat = self.chat()
+        self.enter(chat, "one")
+        self.enter(chat, "/retry")
+        self.assertEqual([m["content"] for m in chat.messages], ["one", "Echo: one"])
+        self.assertEqual(len(self.runs()), 2)
+        self.enter(chat, "/undo")
+        self.assertEqual((chat.messages, chat.entry), ([], "one"))
+        self.enter(chat, "/retry")
+        self.assertIn("no reply to retry", chat.status)
+        self.enter(chat, "/device Vulkan7")
+        self.enter(chat, "two")
+        args = self.runs()[-1][0]
+        self.assertEqual(args[args.index("--device") + 1], "Vulkan7")
+        self.enter(chat, "/device auto")
+        self.enter(chat, "three")
+        self.assertNotIn("--device", self.runs()[-1][0])
+
+    def test_save_writes_the_chat_as_markdown(self):
+        chat = self.chat()
+        self.enter(chat, "/save")
+        self.assertIn("Nothing to save yet.", chat.status)
+        chat.system = "Rule"
+        self.enter(chat, "q")
+        target = self.root / "out/chat.md"
+        self.enter(chat, f"/save {target}")
+        text = target.read_text()
+        self.assertTrue(text.startswith("# Chat with Dream Coder\n"))
+        self.assertIn("\n## System prompt\n\nRule\n\n## You\n\nq\n\n## Dream Coder\n\nEcho: q\n", text)
+        self.assertIn(str(target), chat.status)
+        self.enter(chat, "/save")
+        saved = list((self.root / "data/kilix-chat/chats").glob("chat-*.md"))
+        self.assertEqual([p.read_text() for p in saved], [text])
+
+    def test_help_completion_and_the_hint_line(self):
+        chat = self.chat()
+        self.enter(chat, "/help")
+        title, lines = chat.info
+        text = "\n".join(lines)
+        self.assertEqual(title, "Commands")
+        for name in ("quit", "exit", "model", "context", "memory", "clear", "new", "system", "length", "steps",
+                     "save", "help", "retry", "undo", "device"):
+            self.assertIn("/" + name, text)
+        self.assertIn("F2 model", text)
+        for typed, completed in (("/mo", "/model "), ("/s", "/s"), ("/st", "/steps "), ("/re", "/re"),
+                                 ("/rem", "/remember "), ("/memory c", "/memory clear "), ("/memory", "/memory "),
+                                 ("/zz", "/zz"), ("hello", "hello"), ("//co", "//co")):
+            self.assertEqual(commands.complete(typed), completed, typed)
+        chat.entry = "/con"
+        tui.handle(chat, "\t")
+        self.assertEqual(chat.entry, "/context ")
+        self.assertEqual(commands.hint("/s"), "/system  /steps  /save   (Tab completes)")
+        self.assertEqual(commands.hint("/model x"), "/model [GGUF|ollama:NAME] — choose a model, or switch to the one named")
+        self.assertEqual(commands.hint("/zz"), "Unknown command /zz. /help lists the commands.")
+        screen = Screen()
+        chat.status = "Ready."
+        with patch.object(tui.curses, "color_pair", lambda n: 0):
+            chat.entry = "/memo"
+            tui.draw(screen, chat)
+            self.assertEqual(screen.rows[18], commands.hint("/memo"))
+            self.assertEqual(screen.rows[19], "> /memo")
+            chat.entry = "hello"
+            tui.draw(screen, chat)
+            self.assertEqual(screen.rows[18], "Ready.")
+
+
+class OllamaContextTest(unittest.TestCase):
+    def serve(self, loaded, shown):
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+            def reply(self, body):
+                data = json.dumps(body).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            def do_GET(self):
+                self.reply({"models": loaded})
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.reply(shown)
+        http = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        patcher = patch.dict(os.environ, OLLAMA_HOST=f"127.0.0.1:{http.server_address[1]}")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_the_window_comes_from_the_loaded_model_then_its_parameters(self):
+        shown = {"parameters": "num_keep 24\nstop \"<x>\"",
+                 "model_info": {"general.architecture": "llama", "llama.context_length": 8192}}
+        self.serve([{"name": "other:1", "context_length": 999}, {"name": "small:v2", "context_length": 4096}], shown)
+        model = models.Model("ollama:small:v2")
+        self.assertEqual(model.backend.context_length()[0], 4096)
+        self.assertEqual(models.Model("ollama:big:1").backend.context_length(),
+                         (8192, "the model's trained length; Ollama may load it with a smaller num_ctx"))
+        shown["parameters"] = "num_ctx 2048"
+        self.assertEqual(models.Model("ollama:big:1").backend.context_length()[0], 2048)
+        history = [{"role": "system", "content": "abcd"}] + [{"role": "user", "content": "é" * 400}] * 30
+        budget = models.Model("ollama:big:1").budget(history, max_tokens=256)
+        per_turn = 800 // ollama.BYTES_PER_TOKEN + ollama.MESSAGE_TOKENS
+        self.assertEqual((budget.context, budget.exact, budget.turns), (2048, False, 30))
+        self.assertEqual(budget.full_tokens, 5 + 30 * per_turn)
+        self.assertEqual(budget.dropped, 30 - (2048 - 256 - 5) // per_turn)
+        self.assertEqual(budget.prompt_tokens, 5 + (30 - budget.dropped) * per_turn)
 
 
 if __name__ == "__main__":

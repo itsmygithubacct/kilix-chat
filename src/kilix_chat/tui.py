@@ -265,6 +265,11 @@ def draw(screen, chat):
             rows = transcript_lines(chat.messages, chat.partial, width - 2,
                                     chat.model.name if chat.model else "Model", chat.info)
         end = max(0, len(rows) - chat.scroll)
+        if chat.partial is not None and chat.partial[1].startswith("(step"):
+            # A denoising reply changes everywhere at once, and its end is
+            # padding that is settled last. Keep its start in view.
+            start = max(i for i, (_, style) in enumerate(rows) if style == "them")
+            end = max(0, min(len(rows), start + body) - chat.scroll)
         visible = rows[max(0, end - body):end]
         styles = {"you": curses.A_BOLD | curses.color_pair(1), "them": curses.A_BOLD | curses.color_pair(2),
                   "text": curses.A_NORMAL, "partial": curses.A_DIM,

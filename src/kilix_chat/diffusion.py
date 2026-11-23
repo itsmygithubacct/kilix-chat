@@ -19,10 +19,17 @@ import time
 
 from kilix_chat import gguf
 
-# Sampling algorithm per GGUF architecture, from the llama.cpp diffusion
-# examples: confidence for LLaDA, entropy for Dream and RND1. Every model uses
-# the timestep schedule, which puts no block constraint on the length.
-ARCHITECTURES = {"llada": 4, "llada-moe": 4, "dream": 1, "rnd1": 1}
+# Which masked tokens llama-diffusion-cli fills first, per GGUF architecture.
+# Every one uses 4, the most probable tokens first. Dream and RND1 are meant
+# for entropy order (1), but llama.cpp ranks entropy the wrong way round: its
+# confidence is the entropy itself, sorted highest first, so it fills the
+# least certain tokens first and Dream-Coder writes broken code. Every model
+# uses the timestep schedule, which puts no block constraint on the length.
+ARCHITECTURES = {"llada": 4, "llada-moe": 4, "dream": 4, "rnd1": 4}
+# llama-diffusion-cli at --temp 0 leaves out its temperature sampler and so
+# samples at temperature 1. A low temperature comes close to always taking the
+# most probable token, which the models are tuned for.
+TEMPERATURE = "0.1"
 # The chat template adds a few dozen tokens around the system and user text.
 TEMPLATE_TOKENS = 64
 CLEAR = "\x1b[2J\x1b[H"
@@ -196,7 +203,7 @@ class DiffusionModel:
                     "-c", str(length), "-b", str(length), "-ub", str(length),
                     "--diffusion-steps", str(steps), "--diffusion-eps", "0.001",
                     "--diffusion-algorithm", str(ARCHITECTURES[self.architecture]),
-                    "--temp", "0", "--seed", "0", "-ngl", "99",
+                    "--temp", TEMPERATURE, "--seed", "0", "-ngl", "99",
                     "--log-file", str(log), "--no-log-prefix", "--no-log-timestamps", "--log-colors", "off"]
             if system:
                 args[5:5] = ["-sys", system]

@@ -169,7 +169,7 @@ class DiffusionTest(Fixture):
         self.assertEqual((system, text), ("Rule", "hello"))
         self.assertEqual([option(o) for o in ("-c", "-b", "-ub")], ["111"] * 3)
         self.assertEqual((option("--diffusion-steps"), option("--diffusion-algorithm"), option("--temp"),
-                          option("--device"), option("-m")), ("20", "1", "0", "Vulkan9", str(self.dream.resolve())))
+                          option("--device"), option("-m")), ("20", "4", "0.1", "Vulkan9", str(self.dream.resolve())))
         self.assertIn("--no-log-prefix", args)
         self.assertNotIn("--diffusion-visual", args)
         self.assertEqual(libraries.split(os.pathsep)[0], str(self.tools.resolve()))
@@ -607,6 +607,26 @@ class CommandTest(Fixture):
         self.assertTrue(chat.visual)
         self.enter(chat, "/diffusion off")
         self.assertFalse(chat.visual)
+
+    def test_a_tall_denoising_reply_keeps_its_start_in_view(self):
+        chat = self.chat()
+        chat.messages = [{"role": "user", "content": f"question {n}"} for n in range(20)]
+        frame = "\n".join(f"line {n}" for n in range(30))
+        screen = Screen(height=12, width=60)
+        with patch.object(tui.curses, "color_pair", lambda n: 0):
+            chat.partial = (frame, "(step 3/8)")
+            tui.draw(screen, chat)
+            self.assertEqual([screen.rows[y] for y in (1, 2, 9)], ["Dream Coder (step 3/8)", "line 0", "line 7"])
+            chat.scroll = 2
+            tui.draw(screen, chat)
+            self.assertEqual(screen.rows[1], "question 19")
+            chat.scroll = 0
+            chat.partial = (frame, "")   # streamed text grows at its end
+            tui.draw(screen, chat)
+            self.assertEqual(screen.rows[9], "line 29")
+            chat.partial = ("short", "(step 1/8)")   # a frame that fits shows like any reply
+            tui.draw(screen, chat)
+            self.assertEqual([screen.rows[y] for y in (8, 9)], ["Dream Coder (step 1/8)", "short"])
 
     def test_help_completion_and_the_hint_line(self):
         chat = self.chat()

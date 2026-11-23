@@ -71,7 +71,9 @@ itself. Indentation therefore looks masked until the reply is finished, and
 the finished reply is shown exactly as the model wrote it. The sequence is as
 long as the reply length, and most of it ends up as end-of-text padding,
 which LLaDA unmasks first, so the masks shrink for most of the steps before
-the words arrive. A shorter `/length` gets to the words sooner.
+the words arrive. A shorter `/length` gets to the words sooner. While a reply denoises,
+the window keeps its start in view, because its end is padding that is
+settled last. PgUp and PgDn still scroll.
 
 ### Memory
 
@@ -100,9 +102,23 @@ turns of an overlong prompt by the same rule.
 
 llama-server cannot load diffusion models, so every reply is one
 `llama-diffusion-cli` run. The sequence holds the conversation plus the reply
-length, denoised in half as many steps at temperature 0 with seed 0. The
-sampling algorithm comes from the GGUF architecture: confidence for LLaDA and
-entropy for Dream and RND1. A sibling `llama-tokenize` sizes the prompt
+length, denoised in half as many steps at temperature 0.1 with seed 0. Each
+step fills the masked tokens the model is most sure of
+(`--diffusion-algorithm 4`).
+
+Two llama.cpp behaviours set those choices. Up to at least upstream master
+of October 2026:
+
+- `--temp 0` does not take the most probable token. It leaves out the
+  temperature sampler and so samples at temperature 1. A temperature of 0.1
+  comes close to always taking the most probable token.
+- Entropy order (`--diffusion-algorithm 1`), which Dream and RND1 are meant
+  to use, is ranked the wrong way round. Its confidence is the entropy
+  itself, sorted highest first, so it fills the least certain tokens first.
+
+With entropy order at `--temp 0`, Dream-Coder-v0-Instruct-7B wrote code that
+used undefined names. With confidence order at 0.1, the same prompts gave
+correct code. A sibling `llama-tokenize` sizes the prompt
 exactly. Without it, the UTF-8 byte count serves as an upper bound. A
 conversation that outgrows the model's context drops its oldest turns.
 

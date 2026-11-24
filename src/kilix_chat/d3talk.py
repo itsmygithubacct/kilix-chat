@@ -31,12 +31,14 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import functools
+from http.client import HTTPException
 import math
 import os
 from pathlib import Path
 import re
 import shutil
 import sys
+import tempfile
 import time
 from urllib.error import URLError
 from urllib.request import Request, urlopen
@@ -115,21 +117,37 @@ def data_dir():
     return memory.data_dir() / "d3-talk"
 
 
+def write_atomically(target, text):
+    """Write `text` to a sibling with a name of its own, then rename it over
+    `target`, so a reader never sees half a file and two writers never share one."""
+    handle, part = tempfile.mkstemp(prefix=f".{target.name}-", suffix=".part", dir=target.parent)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as out:
+            out.write(text)
+        os.replace(part, target)
+    except BaseException:
+        Path(part).unlink(missing_ok=True)
+        raise
+
+
 def fetch(directory):
     """Download the frequency lists that `directory` does not hold yet."""
     for name, url in SOURCES.items():
         target = directory / name
         if target.exists():
             continue
-        directory.mkdir(parents=True, exist_ok=True)
-        part = target.with_name(name + ".part")
+        part = None
         try:
+            directory.mkdir(parents=True, exist_ok=True)
+            handle, part = tempfile.mkstemp(prefix=f".{name}-", suffix=".part", dir=directory)
             with urlopen(Request(url, headers={"User-Agent": "curl"}), timeout=120) as response, \
-                    open(part, "wb") as out:
+                    os.fdopen(handle, "wb") as out:
                 shutil.copyfileobj(response, out)
             os.replace(part, target)
-        except (OSError, URLError) as error:
-            part.unlink(missing_ok=True)
+        except (OSError, URLError, HTTPException) as error:
+            # A download cut short raises IncompleteRead, which is no OSError.
+            if part:
+                Path(part).unlink(missing_ok=True)
             raise RuntimeError(f"d3-talk needs word frequencies and could not download {url} ({error}). "
                                f"Put count_1w.txt and count_2w.txt in {directory}.") from error
 
@@ -190,36 +208,58 @@ class Lexicon:
                 self.offer_after.setdefault(before, []).append(contraction)
 
         # What the model has used: (word before, word) -> [times, sum of confidence].
-        self.used, self.used_after, self.used_word = {}, {}, {}
-        try:
-            with open(self.usage_path(), encoding="utf-8") as rows:
-                for row in rows:
-                    parts = row.rstrip("\n").split("\t")
-                    if len(parts) == 4:
-                        self._count_use(parts[0], parts[1], int(parts[2]), float(parts[3]))
-        except (OSError, ValueError):
-            pass
+        self._use(self.saved_usage())
 
     def usage_path(self):
         return self.directory / "usage.tsv"
 
-    def _count_use(self, before, word, times, confidence):
-        entry = self.used.setdefault((before, word), [0, 0.0])
-        entry[0] += times
-        entry[1] += confidence
-        self.used_after[before] = self.used_after.get(before, 0) + times
-        self.used_word[word] = self.used_word.get(word, 0) + times
+    def saved_usage(self):
+        """The usage as saved: {(word before, word): [times, sum of confidence]}.
+
+        A row that does not parse is skipped, not the rest of the file, which
+        the next save would otherwise drop."""
+        saved = {}
+        try:
+            with open(self.usage_path(), encoding="utf-8") as rows:
+                for row in rows:
+                    parts = row.rstrip("\n").split("\t")
+                    try:
+                        times, confidence = int(parts[2]), float(parts[3])
+                    except (IndexError, ValueError):
+                        continue
+                    if len(parts) == 4 and times > 0:
+                        entry = saved.setdefault((parts[0], parts[1]), [0, 0.0])
+                        entry[0] += times
+                        entry[1] += confidence
+        except OSError:
+            pass
+        return saved
+
+    def _use(self, used):
+        self.used, self.used_after, self.used_word = used, {}, {}
+        for (before, word), (times, _) in used.items():
+            self.used_after[before] = self.used_after.get(before, 0) + times
+            self.used_word[word] = self.used_word.get(word, 0) + times
 
     def learn(self, steps):
-        """Count a finished reply: [(word before, word, confidence), ...]."""
+        """Count a finished reply: [(word before, word, confidence), ...].
+
+        The counts are added to the file as it is now, so replies learned by
+        another kilix-chat or d3-talk since this one read it are kept. Return
+        whether they were saved; a failed save never costs the reply."""
+        used = self.saved_usage()
         for before, word, confidence in steps:
-            self._count_use(before, word, 1, confidence)
-        target = self.usage_path()
-        part = target.with_name(target.name + ".part")
-        with open(part, "w", encoding="utf-8") as out:
-            for (before, word), (times, confidence) in sorted(self.used.items()):
-                out.write(f"{before}\t{word}\t{times}\t{confidence:.2f}\n")
-        os.replace(part, target)
+            entry = used.setdefault((before, word), [0, 0.0])
+            entry[0] += 1
+            entry[1] += confidence
+        self._use(used)
+        try:
+            write_atomically(self.usage_path(), "".join(
+                f"{before}\t{word}\t{times}\t{confidence:.2f}\n"
+                for (before, word), (times, confidence) in sorted(used.items())))
+        except OSError:
+            return False
+        return True
 
     def followers(self, before, limit):
         """Words likely to follow `before`, most likely first: how often the
@@ -306,7 +346,8 @@ def split(messages):
         if role in ("system", "developer"):
             notes.append(text)
         elif role == "user":
-            said = text
+            # Two user messages in a row are one thing to answer.
+            said = f"{said}\n{text}" if said else text
         elif role == "assistant" and said is not None:
             turns.append((said, text))
             said = None
@@ -539,7 +580,8 @@ class Talker:
             for word, odds in written:
                 steps.append((before, word, odds))
                 before = START if word in STOPS else before if word in PUNCT else word
-            self.lexicon.learn(steps)
+            if not self.lexicon.learn(steps):
+                self.detail(f"  could not save what was learned to {self.lexicon.usage_path()}")
         return self.show(self.words)
 
 

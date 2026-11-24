@@ -1060,6 +1060,42 @@ class D3TalkTest(Fixture):
                 self.assertRaisesRegex(RuntimeError, f"Put count_1w.txt and count_2w.txt in {self.data}"):
             d3talk.fetch(self.data)
         self.assertEqual(sorted(path.name for path in self.data.iterdir()), ["count_1w.txt", "usage.tsv"])
+        # a download cut short is reported like any failed one, and leaves nothing behind
+        class CutShort:
+            def __enter__(self):
+                return self
+            def __exit__(self, *_):
+                return False
+            def read(self, *_):
+                raise http.client.IncompleteRead(b"of the\t9", 5000)
+        with patch.object(d3talk, "urlopen", return_value=CutShort()), \
+                self.assertRaisesRegex(RuntimeError, "could not download .*count_2w.txt"):
+            d3talk.fetch(self.data)
+        self.assertEqual(sorted(path.name for path in self.data.iterdir()), ["count_1w.txt", "usage.tsv"])
+        # two user messages in a row are answered together
+        self.assertEqual(d3talk.split([{"role": "user", "content": "Hi."}, {"role": "user", "content": "Paris?"}]),
+                         ("", [], "Hi.\nParis?"))
+
+    def test_learning_keeps_other_writers_rows_and_a_failed_save_keeps_the_reply(self):
+        usage = self.data / "usage.tsv"
+        usage.write_text("<S>\tit\t2\t1.50\nnot a row\nis\tparis\tmany\t1\nis\tparis\t3\t2.40\nit\tis\t0\t0\n")
+        first, second = d3talk.Lexicon(self.data), d3talk.Lexicon(self.data)
+        # a bad row is skipped, not the rows after it
+        self.assertEqual(first.used, {("<S>", "it"): [2, 1.5], ("is", "paris"): [3, 2.4]})
+        self.assertTrue(first.learn([("it", "is", 0.9)]))
+        self.assertTrue(second.learn([("is", "the", 0.5)]))    # read the file before `first` saved
+        self.assertEqual(usage.read_text().splitlines(),
+                         ["<S>\tit\t2\t1.50", "is\tparis\t3\t2.40", "is\tthe\t1\t0.50", "it\tis\t1\t0.90"])
+        self.assertEqual((second.used_after["it"], second.used_word["the"]), (1, 1))
+        # a usage file that cannot be written costs the learning, never the reply
+        usage.unlink()
+        usage.mkdir()
+        lines = []
+        talker = d3talk.Talker("d3:2b", d3talk.lexicon(), on_detail=lines.append)
+        self.assertEqual(talker.reply("What is the capital of France?", max_words=6), self.wanted)
+        self.assertTrue(any(line.strip().startswith("could not save what was learned") for line in lines))
+        self.assertEqual(sorted(path.name for path in self.data.iterdir()),
+                         ["count_1w.txt", "count_2w.txt", "usage.tsv"])
 
     def test_the_commands_and_the_window_talk_with_a_decision_model(self):
         asked = subprocess.run([PROJECT / "kilix-chat", "--model", "d3-talk:d3:2b", "--max-tokens", "6", "ask",

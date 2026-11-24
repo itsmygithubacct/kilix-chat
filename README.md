@@ -250,7 +250,10 @@ Word and word-pair frequencies come from Peter Norvig's
 [n-gram lists](https://norvig.com/ngrams/) (`count_1w.txt` and
 `count_2w.txt`, 10 MB together). They are downloaded on first use into
 `$XDG_DATA_HOME/kilix-chat/d3-talk/`, where the learned usage is kept as
-`usage.tsv`. To work offline, put the two files there yourself. Spellings
+`usage.tsv`. A reply's counts are added to the file as it stands, so the
+chat window, `serve` and `d3-talk` can learn at once. If the file cannot
+be written, the reply is still given. To work offline, put the two files
+there yourself. Spellings
 and capitals are checked against `/usr/share/dict/words` when it exists
 (`KILIX_CHAT_WORD_LIST` names another list); without one, every alphabetic
 word in the lists counts and names are not capitalised.

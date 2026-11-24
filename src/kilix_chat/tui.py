@@ -17,7 +17,7 @@ from kilix_chat.models import catalog, load
 LENGTHS = (64, 128, 256, 512)
 HELP = ("Enter send · /help commands · F2 model · F3 reply length · F4 show denoising · Ctrl-N new chat · "
         "Esc stop · F10 quit")
-ENTRY = "Enter a GGUF path or ollama:NAME..."
+ENTRY = "Enter a GGUF path, ollama:NAME or d3-talk:NAME..."
 
 
 def wrap(text, width):

@@ -1,23 +1,28 @@
-"""One interface over diffusion GGUFs and Ollama models."""
+"""One interface over diffusion GGUFs, Ollama models and d3-talk."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
 
-from kilix_chat import diffusion, ollama, prompt
+from kilix_chat import d3talk, diffusion, ollama, prompt
 
 OLLAMA_PREFIX = "ollama:"
+D3TALK_PREFIX = "d3-talk:"
 
 
 def catalog():
     """(spec, label) for every model kilix-chat can open on this machine."""
     rows = [(path, f"{Path(path).name}  [{kind}]") for path, kind in diffusion.local_models()]
-    rows += [(OLLAMA_PREFIX + name, f"{name}  [ollama]") for name in ollama.local_models()]
+    chat, decision = ollama.models_by_kind()
+    rows += [(OLLAMA_PREFIX + name, f"{name}  [ollama]") for name in chat]
+    # A decision model cannot chat by itself, so it is offered through d3-talk.
+    rows += [(D3TALK_PREFIX + name, f"{name}  [d3-talk]") for name in decision]
     return rows
 
 
 def load(spec, *, device=None):
-    """Open the model `spec` names: a diffusion GGUF path, or ollama:NAME.
+    """Open the model `spec` names: a diffusion GGUF path, ollama:NAME, or
+    d3-talk:NAME for an Ollama decision model.
 
     Every part of kilix-chat opens models here, so this is the seam for
     anything that must know which model is about to use the GPU. A diffusion
@@ -59,6 +64,8 @@ class Model:
         self.spec = spec
         if spec.startswith(OLLAMA_PREFIX):
             self.backend = ollama.OllamaModel(spec[len(OLLAMA_PREFIX):])
+        elif spec.startswith(D3TALK_PREFIX):
+            self.backend = d3talk.D3TalkModel(spec[len(D3TALK_PREFIX):])
         else:
             self.backend = diffusion.DiffusionModel(spec, device=device)
         self.name = self.backend.name

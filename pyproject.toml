@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [{ name = "itsmygithubacct", email = "itsmygithubacct@users.noreply.github.com" }]
-keywords = ["chat", "diffusion", "llama.cpp", "kilix"]
+keywords = ["chat", "diffusion", "llama.cpp", "ollama", "kilix"]
 classifiers = [
   "Environment :: Console",
   "License :: OSI Approved :: MIT License",
@@ -21,6 +21,7 @@ dependencies = []
 
 [project.scripts]
 kilix-chat = "kilix_chat.cli:main"
+d3-talk = "kilix_chat.d3talk:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

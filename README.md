@@ -6,11 +6,15 @@ models (LLaDA, LLaDA-MoE, Dream, DiffuCoder, RND1) through llama.cpp's
 A diffusion reply appears all at once and sharpens step by step as it
 denoises, rather than growing word by word: the window draws every token
 that is still masked as `░`, and words settle into place among them.
+With d3-talk it also chats with Ollama's decision models, such as `d3:2b`,
+which can only choose among options: the reply is built from the model's
+choices, one word at a time.
 
 ```sh
 ./kilix-chat                                   # pick a model, then chat
 ./kilix-chat --model ~/models/LLaDA-1.5.Q4_K_M.gguf --device Vulkan1
 ./kilix-chat --model ollama:qwen3.5:4b
+./kilix-chat --model d3-talk:d3:2b             # a decision model, through d3-talk
 ./kilix-chat models                            # what it can open here
 ./kilix-chat --model MODEL.gguf ask "Is two even?"
 ./kilix-chat --model MODEL.gguf serve --port 8765 --alias local
@@ -41,7 +45,7 @@ Start a message with `//` to send it with a single leading `/`.
 | Command | Action |
 |---|---|
 | `/help` (`/?`) | List the commands and keys |
-| `/model [SPEC]` | Open the model picker, or switch to a GGUF path or `ollama:NAME` |
+| `/model [SPEC]` | Open the model picker, or switch to a GGUF path, `ollama:NAME` or `d3-talk:NAME` |
 | `/context` | Show the prompt's tokens against the model's context, the reply budget, and how many old turns would be dropped |
 | `/memory` | Show the saved notes |
 | `/memory add TEXT`, `/remember TEXT` | Save a note |
@@ -177,6 +181,92 @@ short or garbled than at 32, on both prompt sets. llama.cpp's 32-token
 block schedule (`--diffusion-block-length 32`) did no better than the
 timestep schedule at 40 or 80 steps.
 
+## d3-talk: decision models
+
+Ollama's decision models (`d3:2b`, `d3:4b`, `d3:9b`, `d3:27b`; upstream
+`vllm-sr/d3-nano` and its siblings) do not write text. Each request puts a
+question to the model about some text, and the answer is a probability for
+every option offered. They are unrelated to d3LLM above, which is a
+diffusion model. Ollama refuses to chat with one, so the model picker lists
+each as `NAME  [d3-talk]`, and `d3-talk:NAME` opens it.
+
+d3-talk builds a reply out of multiple-choice questions, always offering the
+most-used words first:
+
+1. **Think.** The 4,000 most-used English words are swept in order of use,
+   100 to a question, and the model picks the words a good answer would
+   name. Five survive each question, the survivors compete, and the best 24
+   are the topic words, together with the content words of your message.
+2. **Compose.** The reply grows one word at a time. Each step asks about
+   three groups of up to 14 choices: the words that most often follow the
+   last word, the most-used grammar words, and the topic words. Each choice
+   is shown to the model as the reply so far with that word added. The best
+   two of every group meet in a final. A sentence has to open on a grammar
+   word; when topic words could open one, replies read like headlines.
+3. **Compare.** Three partial replies are kept alive. After every word the
+   model ranks them as whole sentences, which it does far better than it
+   picks single words. After a full stop it is asked whether the reply needs
+   another sentence, and a second sentence stays only if the model prefers
+   the reply with it.
+4. **Learn.** Every word of the finished reply is counted with the word
+   before it, and pairs the model uses often are offered earlier next time.
+
+In the chat window the reply is shown as it stands after every word, after a
+line of topic words as they are found. The reply length counts words. The
+system prompt and the memory are sent with every question, cut to 400
+characters, and so are the last three exchanges.
+
+`kilix-chat --model d3-talk:d3:2b serve` serves it like any other model,
+so OpenAI and Ollama clients can chat with a decision model. The reported
+prompt tokens add up every question's prompt: about 41,000 for the reply
+"It is Paris." A request that offers tools is refused, as it is for an
+Ollama model.
+
+The same engine runs on its own as `d3-talk`:
+
+```sh
+./d3-talk "What is the capital of France?"     # one reply
+./d3-talk                                      # one message per line
+./d3-talk --show "Why is the sky blue?"        # the reply after every word, a line each
+./d3-talk -v "How are you today?"              # the topic words and the choices at every step
+./d3-talk --usage                              # the word pairs it has used most
+```
+
+`-m MODEL` names another decision model, `-b N` the number of partial
+replies kept (1 is fastest and much worse), `-s N` the most sentences,
+`--max-words N` the most words in a sentence, `--vocab N` how many words the
+sweep covers (0 skips it), `--judge MODEL` a larger decision model for the
+final choice, and `--no-learn` leaves the usage counts alone.
+
+Word and word-pair frequencies come from Peter Norvig's
+[n-gram lists](https://norvig.com/ngrams/) (`count_1w.txt` and
+`count_2w.txt`, 10 MB together). They are downloaded on first use into
+`$XDG_DATA_HOME/kilix-chat/d3-talk/`, where the learned usage is kept as
+`usage.tsv`. To work offline, put the two files there yourself. Spellings
+and capitals are checked against `/usr/share/dict/words` when it exists
+(`KILIX_CHAT_WORD_LIST` names another list); without one, every alphabetic
+word in the lists counts and names are not capitalised.
+
+What to expect, measured 2026-11-23 with `d3:2b` (Q8_0) on a Quadro RTX
+3000 (6 GB), which holds the whole model:
+
+- A question costs about 30 ms plus 0.27 ms per prompt token, and the model
+  reads the conversation and every option again for each question. Sending
+  questions in parallel, or several in one request, was no faster. A reply
+  takes about 90 to 250 questions and 10 to 30 seconds, of which the sweep
+  is 45 questions and about 7 seconds.
+- Short factual questions come out well ("It is Paris.", "I feel well
+  today.", "It's four total."). Open questions give vaguer sentences, and a
+  sentence can end unfinished. The wording changes from run to run.
+- Against ten reference replies the model picked the reference's next word
+  30% of the time from one list of 40 choices, and 40% of the time (65%
+  within its top three) from three small groups with a final. Asking it for
+  the next word's first letter (19%) or whether a grammar word or a content
+  word comes next (63%) did not help, so neither is used.
+- If the model is loaded while the GPU is full, Ollama keeps it on the CPU,
+  where a question takes seconds. `ollama ps` shows the split, and
+  `ollama stop d3:2b` makes the next reply load it again.
+
 ## Serving a coding agent or a chat client
 
 `kilix-chat serve` listens on loopback only (127.0.0.1, ::1 or localhost) and
@@ -230,6 +320,6 @@ Ollama keeps a large model loaded.
 ## Tests
 
 ```sh
-make test       # offline, against a stand-in llama-diffusion-cli
+make test       # offline: stand-ins for llama-diffusion-cli and a decision model
 make defects    # every planted defect must turn the suite red
 ```

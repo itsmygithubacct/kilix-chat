@@ -10,6 +10,7 @@ TESTS := $(wildcard tests/*.py)
 # `all` is what a content-catalog install runs. It builds; it does not test.
 all: compile
 	@test -x ./kilix-chat || { echo 'kilix-chat launcher is not executable'; exit 1; }
+	@test -x ./d3-talk || { echo 'd3-talk launcher is not executable'; exit 1; }
 
 help:
 	@printf '%s\n' \
@@ -22,7 +23,7 @@ help:
 		'  make clean    remove bytecode'
 
 compile:
-	$(PYTHON) -m compileall -q src tests kilix-chat
+	$(PYTHON) -m compileall -q src tests kilix-chat d3-talk
 
 test:
 	PYTHONPATH=src $(PYTHON) -m unittest discover -s tests

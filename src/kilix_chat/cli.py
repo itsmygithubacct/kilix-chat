@@ -11,7 +11,7 @@ from kilix_chat.models import Model, catalog
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="kilix-chat", description=__doc__)
     parser.add_argument("--version", action="version", version=f"kilix-chat {__version__}")
-    parser.add_argument("--model", help="a diffusion GGUF path, or ollama:NAME")
+    parser.add_argument("--model", help="a diffusion GGUF path, ollama:NAME, or d3-talk:NAME for a decision model")
     parser.add_argument("--device", help="llama.cpp device for diffusion models, for example Vulkan1")
     parser.add_argument("--max-tokens", type=int, default=256, help="reply length in tokens (default 256)")
     sub = parser.add_subparsers(dest="command")

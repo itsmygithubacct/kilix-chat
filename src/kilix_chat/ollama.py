@@ -1,4 +1,5 @@
-"""Chat with a model served by a local Ollama daemon."""
+"""Chat with a model served by a local Ollama daemon, or put a question to
+one of its decision models."""
 from __future__ import annotations
 
 import json
@@ -32,12 +33,53 @@ def _post(path, body, timeout):
     return urlopen(request, timeout=timeout)
 
 
-def local_models(timeout=2):
+def is_decision(row):
+    """Whether an /api/tags row is a decision model: one that answers
+    questions about text and cannot write any."""
+    capabilities = row.get("capabilities") or []
+    return "decision" in capabilities and "completion" not in capabilities
+
+
+def models_by_kind(timeout=2):
+    """(names of the models that chat, names of the decision models)."""
     try:
         with urlopen(base_url() + "/api/tags", timeout=timeout) as response:
-            return sorted({row["name"] for row in json.load(response).get("models", [])})
-    except (OSError, URLError, ValueError, KeyError):
-        return []
+            rows = json.load(response).get("models", [])
+        chat = sorted({row["name"] for row in rows if not is_decision(row)})
+        return chat, sorted({row["name"] for row in rows if is_decision(row)})
+    except (OSError, URLError, ValueError, KeyError, AttributeError):
+        return [], []
+
+
+def local_models(timeout=2):
+    return models_by_kind(timeout)[0]
+
+
+def decide(model, state, question, options, timeout=600):
+    """Put one multiple-choice question to a decision model.
+
+    `state` is the text the question is about, and `options` maps each
+    choice's key to the text shown beside it, which may be empty. Returns
+    ([(key, probability), ...] most likely first, prompt tokens). The model
+    reads the state and every option again for each question, so the cost
+    grows with their length.
+    """
+    body = {"model": model, "state": state,
+            "questions": {"q": {"type": "choice", "instructions": question, "criteria": options}}}
+    try:
+        with _post("/v1/systemone", body, timeout) as response:
+            answer = json.load(response)
+        odds = answer["answers"]["q"]["probabilities"]
+        ranked = sorted(((key, float(value)) for key, value in odds.items()), key=lambda item: -item[1])
+    except HTTPError as error:
+        detail = error.read().decode("utf-8", "replace")
+        raise RuntimeError(f"Ollama returned HTTP {error.code} for a decision question to {model}. "
+                           f"{detail[:300]}") from error
+    except (OSError, URLError) as error:
+        raise RuntimeError(f"Could not reach Ollama at {base_url()} ({error}).") from error
+    except (ValueError, KeyError, TypeError, AttributeError) as error:
+        raise RuntimeError(f"Ollama's answer to a decision question was not understood ({error!r}).") from error
+    return ranked, (answer.get("usage") or {}).get("input_tokens") or 0
 
 
 def _get(path, timeout):

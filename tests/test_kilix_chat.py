@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """kilix-chat offline: GGUF metadata, prompts, tool calls, the diffusion
-runner against a stand-in llama-diffusion-cli, the server, Ollama, and the
-chat window's keys, slash commands and memory."""
+runner against a stand-in llama-diffusion-cli, the server, Ollama, the
+chat window's keys, slash commands and memory, and d3-talk against a
+stand-in decision model."""
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -21,7 +22,7 @@ from urllib.request import Request, urlopen
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "src"))
 import kilix_chat  # noqa: E402
-from kilix_chat import commands, diffusion, gguf, memory, models, ollama, prompt, server, tui  # noqa: E402
+from kilix_chat import commands, d3talk, diffusion, gguf, memory, models, ollama, prompt, server, tui  # noqa: E402
 
 
 def gguf_bytes(arch, name="Tiny", context=None, extra=()):
@@ -841,7 +842,7 @@ class CommandTest(Fixture):
         tui.handle(chat, "\t")
         self.assertEqual(chat.entry, "/context ")
         self.assertEqual(commands.hint("/s"), "/system  /steps  /save   (Tab completes)")
-        self.assertEqual(commands.hint("/model x"), "/model [GGUF|ollama:NAME] — choose a model, or switch to the one named")
+        self.assertEqual(commands.hint("/model x"), "/model [GGUF|ollama:NAME|d3-talk:NAME] — choose a model, or switch to the one named")
         self.assertEqual(commands.hint("/zz"), "Unknown command /zz. /help lists the commands.")
         screen = Screen()
         chat.status = "Ready."
@@ -896,6 +897,164 @@ class OllamaContextTest(unittest.TestCase):
         self.assertEqual(budget.full_tokens, 5 + 30 * per_turn)
         self.assertEqual(budget.dropped, 30 - (2048 - 256 - 5) // per_turn)
         self.assertEqual(budget.prompt_tokens, 5 + (30 - budget.dropped) * per_turn)
+
+
+WORDS_1W = "the\t90\nof\t80\nis\t70\nit\t60\na\t50\nyou\t45\ncapital\t40\nfrance\t30\nparis\t20\ncity\t10\napple\t9\nwww\t8\nxq\t7\n"
+WORDS_2W = "it is\t900\nis the\t800\nthe capital\t50\ncapital of\t40\nis a\t30\n"
+WORD_LIST = "the\nof\nis\nit\na\nyou\ncapital\ncity\napple\nwww\nxq\nParis\nFrance\n"
+
+
+class D3TalkTest(Fixture):
+    """d3-talk against a stand-in decision model that wants to say
+    "It is Paris." and picks whichever option is the most of it."""
+    wanted = "It is Paris."
+
+    def setUp(self):
+        super().setUp()
+        self.data = self.root / "data" / "kilix-chat" / "d3-talk"
+        self.data.mkdir(parents=True)
+        (self.data / "count_1w.txt").write_text(WORDS_1W)
+        (self.data / "count_2w.txt").write_text(WORDS_2W)
+        (self.root / "words").write_text(WORD_LIST)
+        d3talk._lexicon.cache_clear()
+        self.addCleanup(d3talk._lexicon.cache_clear)
+        asked = self.asked = []
+        test = self
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+            def answer(self, body):
+                data = json.dumps(body).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            def do_GET(self):
+                self.answer({"models": [{"name": "d3:2b", "capabilities": ["decision", "vision"]},
+                                        {"name": "small:v2", "capabilities": ["completion", "tools"]},
+                                        {"name": "old:1"}]})
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                asked.append((self.path, body))
+                options = body["questions"]["q"]["criteria"]
+                def weight(key, text):
+                    if key in ("finished", "paris") and (key == "finished" or not text):
+                        return 50       # stop after one sentence; "paris" is the topic word
+                    shown = text.removesuffix(" ...")
+                    return 1 + 10 * len(shown) if shown and test.wanted.startswith(shown) else 1
+                weights = {key: weight(key, text) for key, text in options.items()}
+                total = sum(weights.values())
+                self.answer({"model": body["model"], "usage": {"input_tokens": 7, "output_tokens": 0},
+                             "answers": {"q": {"type": "choice",
+                                               "probabilities": {k: w / total for k, w in weights.items()}}}})
+        http = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=http.serve_forever, daemon=True).start()
+        self.addCleanup(http.server_close)
+        self.addCleanup(http.shutdown)
+        patcher = patch.dict(os.environ, OLLAMA_HOST=f"127.0.0.1:{http.server_address[1]}",
+                             KILIX_CHAT_WORD_LIST=str(self.root / "words"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_decision_models_are_offered_through_d3_talk_and_the_rest_through_ollama(self):
+        rows = [row for row in models.catalog() if not row[0].endswith(".gguf")]
+        self.assertEqual(rows, [("ollama:old:1", "old:1  [ollama]"), ("ollama:small:v2", "small:v2  [ollama]"),
+                                ("d3-talk:d3:2b", "d3:2b  [d3-talk]")])
+        self.assertEqual(ollama.local_models(), ["old:1", "small:v2"])
+        ranked, tokens = ollama.decide("d3:2b", "state", "Which?", {"a": "x", "b": self.wanted})
+        self.assertEqual(([key for key, _ in ranked], tokens), (["b", "a"], 7))
+        self.assertAlmostEqual(sum(odds for _, odds in ranked), 1.0)
+
+    def test_a_reply_is_chosen_word_by_word_and_its_words_are_learned(self):
+        model = models.Model("d3-talk:d3:2b")
+        self.assertEqual((model.name, model.kind, model.diffusion), ("d3:2b", "d3-talk", False))
+        shown = []
+        history = [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Hello"},
+                   {"role": "assistant", "content": "Hi."},
+                   {"role": "user", "content": "What is the capital of France?"}]
+        reply, calls = model.reply(history, max_tokens=6, on_partial=lambda text, step, steps: shown.append(text))
+        self.assertEqual((reply.text, calls, reply.completion_tokens), (self.wanted, [], 4))
+        self.assertEqual(reply.prompt_tokens, 7 * len(self.asked))
+        self.assertTrue(shown[0].startswith("(choosing topic words) paris"))
+        self.assertEqual([text for text in shown if not text.startswith("(")][:4],
+                         ["It", "It is", "It is Paris", self.wanted])
+        self.assertEqual({(path, body["model"], body["questions"]["q"]["type"]) for path, body in self.asked},
+                         {("/v1/systemone", "d3:2b", "choice")})
+        state = self.asked[-1][1]["state"]
+        for part in ('Notes for the assistant: Be brief.', 'The user said: "Hello"', 'The assistant replied: "Hi."',
+                     'The user said: "What is the capital of France?"'):
+            self.assertIn(part, state)
+        # the corpus never has "paris" after "is"; the finished reply teaches it
+        usage = (self.data / "usage.tsv").read_text().splitlines()
+        self.assertEqual(usage, ["<S>\tit\t1\t" + usage[0].split("\t")[3], "is\tparis\t1\t" + usage[1].split("\t")[3],
+                                 "it\tis\t1\t" + usage[2].split("\t")[3], "paris\t.\t1\t" + usage[3].split("\t")[3]])
+        d3talk._lexicon.cache_clear()
+        self.assertIn("paris", d3talk.lexicon().followers("is", 3))
+
+    def test_choices_come_in_order_of_use_and_a_sentence_opens_on_grammar(self):
+        words = d3talk.lexicon()
+        self.assertEqual(words.words, ["the", "of", "is", "it", "a", "you", "capital", "france", "paris", "city",
+                                       "apple"])      # no web junk, and no two-letter non-words
+        self.assertEqual(words.followers("is", 2), ["the", "a"])
+        self.assertEqual(words.common(3), ["the", "of", "is"])
+        talker = d3talk.Talker("d3:2b", words)
+        opening = talker.groups([], ["paris", "city"])
+        self.assertEqual(opening[0][0], "the")
+        self.assertFalse(any("paris" in group or "." in group for group in opening))
+        later = talker.groups(["it", "is", "the"], ["paris", "city"])
+        self.assertEqual(later[-1], ["paris", "city"])
+        self.assertEqual(later[1][-1], ".")
+        self.assertFalse(any("the" in group for group in later))       # never the same word twice in a row
+        self.assertEqual(d3talk.render("i'm in paris . it is a apple , an city".split(), words.proper),
+                         "I'm in Paris. It is an apple, a city")
+        self.assertEqual(talker.step_options(["it", "is"], ["paris", "."]), {"paris": "It is Paris ...", ".": "It is."})
+
+    def test_stopping_and_missing_pieces_are_reported(self):
+        cancel = threading.Event()
+        cancel.set()
+        with self.assertRaises(diffusion.Cancelled):
+            models.Model("d3-talk:d3:2b").reply([{"role": "user", "content": "hi"}], cancel=cancel)
+        self.assertEqual(self.asked, [])
+        with self.assertRaisesRegex(ValueError, "needs a message from the user"):
+            models.Model("d3-talk:d3:2b").reply([{"role": "system", "content": "x"}])
+        # the reply length is a number of words, and a sentence that runs out of them is closed
+        self.wanted = "It is the capital of France."
+        reply, _ = models.Model("d3-talk:d3:2b").reply([{"role": "user", "content": "And Paris?"}], max_tokens=3)
+        self.assertEqual(reply.text, "It is the.")
+        with patch.dict(os.environ, OLLAMA_HOST="127.0.0.1:9"), self.assertRaisesRegex(RuntimeError, "reach Ollama"):
+            ollama.decide("d3:2b", "s", "q", {"a": ""})
+        # with both lists in place nothing is downloaded; a missing one names where to put it
+        with patch.object(d3talk, "urlopen", side_effect=AssertionError("downloaded")):
+            d3talk.fetch(self.data)
+        (self.data / "count_2w.txt").unlink()
+        with patch.dict(d3talk.SOURCES, {"count_2w.txt": "http://127.0.0.1:9/count_2w.txt"}), \
+                self.assertRaisesRegex(RuntimeError, f"Put count_1w.txt and count_2w.txt in {self.data}"):
+            d3talk.fetch(self.data)
+        self.assertEqual(sorted(path.name for path in self.data.iterdir()), ["count_1w.txt", "usage.tsv"])
+
+    def test_the_commands_and_the_window_talk_with_a_decision_model(self):
+        asked = subprocess.run([PROJECT / "kilix-chat", "--model", "d3-talk:d3:2b", "--max-tokens", "6", "ask",
+                                "What is the capital of France?"], capture_output=True, text=True, timeout=60)
+        self.assertEqual((asked.returncode, asked.stdout), (0, self.wanted + "\n"))
+        talk = [PROJECT / "d3-talk", "--max-words", "6", "--no-learn"]
+        shown = subprocess.run(talk + ["--show", "What", "is", "the", "capital", "of", "France?"],
+                               capture_output=True, text=True, timeout=60)
+        self.assertEqual((shown.returncode, shown.stdout.splitlines()[:4], shown.stdout.splitlines()[-1]),
+                         (0, ["It", "It is", "It is Paris", self.wanted], self.wanted))
+        chatted = subprocess.run(talk + ["-v"], input="What is the capital of France?\n\n", capture_output=True,
+                                 text=True, timeout=60)
+        self.assertEqual((chatted.returncode, chatted.stdout), (0, self.wanted + "\n"))
+        self.assertIn("topic words: paris", chatted.stderr)
+        self.assertIn("4 words from", chatted.stderr)
+        learned = subprocess.run([PROJECT / "d3-talk", "--usage"], capture_output=True, text=True, timeout=60)
+        self.assertIn("is\tparis\t1\t", learned.stdout)       # from `ask`; --no-learn added nothing
+        self.assertEqual(len(learned.stdout.splitlines()), 5)
+        chat = tui.Chat("d3-talk:d3:2b", max_tokens=8)
+        self.assertEqual(chat.status, "Chatting with d3:2b (d3-talk).")
+        chat.entry = "What is the capital of France?"
+        chat.send()
+        chat.worker.join(30)
+        self.assertEqual([m["content"] for m in chat.messages], ["What is the capital of France?", self.wanted])
 
 
 if __name__ == "__main__":

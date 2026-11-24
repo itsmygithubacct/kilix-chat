@@ -204,7 +204,7 @@ def _device(chat, arg):
 
 COMMANDS = (
     Command("help", "", "list the commands and keys", _help, ("?",)),
-    Command("model", "[GGUF|ollama:NAME]", "choose a model, or switch to the one named", _model, idle=True),
+    Command("model", "[GGUF|ollama:NAME|d3-talk:NAME]", "choose a model, or switch to the one named", _model, idle=True),
     Command("context", "", "how much of the model's context this chat uses", _context, idle=True),
     Command("memory", "[add TEXT|forget N|clear]", "show or change the notes kept across chats", _memory,
             choices=("add", "forget", "clear")),

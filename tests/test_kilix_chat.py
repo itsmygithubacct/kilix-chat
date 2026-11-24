@@ -226,6 +226,45 @@ class DiffusionTest(Fixture):
             self.model()
         self.assertEqual(self.runs(), [])
 
+    def test_d3llm_is_recognised_and_decodes_with_its_own_preset(self):
+        def basename(value, key=b"general.basename"):
+            data = value.encode()
+            return struct.pack("<Q", len(key)) + key + struct.pack("<I", 8) + struct.pack("<Q", len(data)) + data
+        plain = self.models / "llada.gguf"
+        plain.write_bytes(gguf_bytes("llada", "LLaDA 8B Instruct", 4096))
+        by_file = self.models / "D3LLM_LLaDA.Q4_K_M.gguf"
+        by_file.write_bytes(gguf_bytes("llada", "Whatever", 4096))
+        by_name = self.models / "a.gguf"
+        by_name.write_bytes(gguf_bytes("llada", "d3LLM LLaDA", 4096))
+        by_base = self.models / "b.gguf"
+        by_base.write_bytes(gguf_bytes("llada", "LLaDA", 4096, extra=[basename("d3LLM_LLaDA")]))
+        # As the real d3LLM_LLaDA GGUF: LLaDA's name, d3LLM only in its source URL.
+        by_source = self.models / "c.gguf"
+        by_source.write_bytes(gguf_bytes("llada", "LLaDA 8B Instruct", 4096, extra=[
+            basename("LLaDA"), basename("https://huggingface.co/d3LLM-model/d3LLM_LLaDA", b"general.source.url")]))
+        unrelated = self.models / "d.gguf"
+        unrelated.write_bytes(gguf_bytes("llada", "LLaDA", 4096, extra=[
+            basename("d3llm", b"tokenizer.chat_template")]))
+        self.assertEqual([models.Model(str(p)).backend.preset.name
+                          for p in (plain, by_file, by_name, by_base, by_source, unrelated)],
+                         ["default", "d3LLM", "d3LLM", "d3LLM", "d3LLM", "default"])
+        self.assertEqual(diffusion.D3LLM_PRESET, diffusion.Preset("d3LLM", 8))
+        model = models.Model(str(by_file))
+        model.reply([{"role": "user", "content": "x"}], max_tokens=256)
+        option = lambda name: self.runs()[-1][0][self.runs()[-1][0].index(name) + 1]
+        self.assertEqual((option("--diffusion-steps"), option("--diffusion-algorithm")), ("32", "4"))
+        model.reply([{"role": "user", "content": "x"}], max_tokens=256, steps=100)
+        self.assertEqual(option("--diffusion-steps"), "100")
+        models.Model(str(plain)).reply([{"role": "user", "content": "x"}], max_tokens=256)
+        self.assertEqual(option("--diffusion-steps"), "128")
+        chat = tui.Chat(str(by_file))
+        self.assertIn("d3LLM preset: 32 steps for 256 tokens", chat.status)
+        chat.entry = "/steps"
+        tui.handle(chat, "\n")
+        self.assertIn("automatic (32 now: the reply length / 8, the d3LLM preset)", chat.status)
+        chat.length = 40
+        self.assertEqual(chat.model.backend.preset.steps(chat.length), diffusion.MIN_STEPS)
+
     def test_without_a_tokenizer_the_byte_length_bounds_the_prompt(self):
         self.counter.unlink()
         self.model().reply([{"role": "user", "content": "café"}], max_tokens=32)

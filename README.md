@@ -49,7 +49,7 @@ Start a message with `//` to send it with a single leading `/`.
 | `/memory clear` | Remove every note |
 | `/system [TEXT]` | Show or set the system prompt (`/system clear` removes it) |
 | `/length [N]` | Show or set the reply length, 8 to 16384 tokens |
-| `/steps [N]` | Show or set the diffusion steps per reply (`/steps auto`: half the reply length) |
+| `/steps [N]` | Show or set the diffusion steps per reply (`/steps auto`: the model's preset, half the reply length, or an eighth for d3LLM) |
 | `/visual [on\|off]` (`/diffusion`) | Show replies as they denoise or stream, or only when finished; with no word it toggles, like F4 |
 | `/device [NAME]` | Show or set the llama.cpp device, for example `Vulkan1` (`/device auto`: llama.cpp chooses) |
 | `/retry` | Ask for the last reply again |
@@ -141,6 +141,41 @@ Models and tools are never downloaded by kilix-chat. Q4_K_M files that fit a
 Dream-v0-Instruct-7B and Dream-Coder-v0-Instruct-7B (4.7 GB each). Build the
 tool from llama.cpp with `cmake -DGGML_VULKAN=ON` (or CUDA) and
 `cmake --build build --target llama-diffusion-cli llama-tokenize`.
+
+### d3LLM
+
+[d3LLM](https://github.com/hao-ai-lab/d3LLM) (arXiv 2601.07568) distils
+LLaDA and Dream so that each denoising step commits many tokens. Its own
+PyTorch decoder needs the BF16 weights, about 16 GB. The
+`mradermacher/d3LLM_LLaDA-GGUF` Q4_K_M file (4.9 GB) runs in
+llama-diffusion-cli on a 6 GB GPU.
+
+kilix-chat recognises d3LLM by its file name or any `general.*` metadata
+text, such as the `general.source.url` that the GGUF carries; it keeps
+LLaDA's `general.name`. It then defaults to an eighth as many steps as
+reply tokens, at least 8, with the most certain tokens filled first.
+`/steps` still overrides this.
+
+Measured 2026-11-23 on a Quadro RTX 3000 (6 GB, Vulkan) with llama.cpp
+b10174: 256-token replies to 10 prompts (explanation, Python, tips,
+arithmetic, an email, a summary, a recipe, a haiku), temperature 0.1.
+"Coherent" means the reply answers the prompt without loops, garbled words
+or a cut-off ending, judged by reading each reply.
+
+| Model | Steps | Seconds per reply | Coherent replies |
+|---|---|---|---|
+| LLaDA-1.5, default | 128 | 59–66 | 7 of 10 |
+| d3LLM | 256 | 132–195 | 5 of 5 (first five prompts only) |
+| d3LLM | 128 | 60–68 | 10 of 10 |
+| d3LLM | 64 | 32–35 | 5 of 10 |
+| d3LLM, default | 32 | 17–25 | 9 of 10 |
+
+At 32 steps, d3LLM was about three times as fast as LLaDA-1.5 at its
+default, with fewer bad replies. Its one failure was a word repeated
+dozens of times in the email. At 64 steps, replies were more often cut
+short or garbled than at 32, on both prompt sets. llama.cpp's 32-token
+block schedule (`--diffusion-block-length 32`) did no better than the
+timestep schedule at 40 or 80 steps.
 
 ## Serving a coding agent or a chat client
 

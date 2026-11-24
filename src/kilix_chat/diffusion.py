@@ -26,6 +26,41 @@ from kilix_chat import gguf
 # least certain tokens first and Dream-Coder writes broken code. Every model
 # uses the timestep schedule, which puts no block constraint on the length.
 ARCHITECTURES = {"llada": 4, "llada-moe": 4, "dream": 4, "rnd1": 4}
+MIN_STEPS = 8
+
+
+@dataclass(frozen=True)
+class Preset:
+    """Default decoding for a family of weights. /steps still overrides it."""
+    name: str
+    divisor: int                 # steps per reply = reply length // divisor
+    algorithm: int | None = None # None: the architecture's
+
+    def steps(self, max_tokens):
+        return max(MIN_STEPS, max_tokens // self.divisor)
+
+
+DEFAULT_PRESET = Preset("default", 2)
+# d3LLM (hao-ai-lab, arXiv 2601.07568) distils LLaDA and Dream to commit many
+# tokens per step. On a 6 GB GPU, at 256-token replies over 10 prompts, its
+# Q4_K_M GGUF gave 9 coherent replies at 32 steps (17-25 s), 5 at 64 steps
+# and 10 at 128. LLaDA-1.5 gave 7 at its default of 128 steps (59-66 s).
+# See README.
+D3LLM_PRESET = Preset("d3LLM", 8)
+
+
+def preset_for(path, info):
+    """d3LLM by file name or any general.* text; else the default.
+
+    The d3LLM_LLaDA GGUF keeps LLaDA's general.name and general.basename, and
+    names d3LLM only in general.source.url and its dataset entries.
+    """
+    names = [Path(path).name] + [v for k, v in info.items() if k.startswith("general.")]
+    if any(isinstance(n, str) and "d3llm" in n.casefold() for n in names):
+        return D3LLM_PRESET
+    return DEFAULT_PRESET
+
+
 # llama-diffusion-cli at --temp 0 leaves out its temperature sampler and so
 # samples at temperature 1. A low temperature comes close to always taking the
 # most probable token, which the models are tuned for.
@@ -157,12 +192,17 @@ class DiffusionModel:
             raise ValueError(f"{self.path.name} is a {self.architecture} model. llama-diffusion-cli runs "
                              + ", ".join(sorted(ARCHITECTURES)) + " models.")
         self.name = info.get("general.name") or self.path.stem
+        self.preset = preset_for(self.path, info)
         self.context = gguf.context_length(info) or 4096
         self.binary = tool()
         self.device = device or os.environ.get("KILIX_CHAT_DEVICE") or os.environ.get("PUZZLLM_GPU")
         self.timeout = timeout
         self.env = {**os.environ, "LD_LIBRARY_PATH": os.pathsep.join(filter(None, (
             str(self.binary.parent), os.environ.get("LD_LIBRARY_PATH"))))}
+
+    @property
+    def algorithm(self):
+        return self.preset.algorithm or ARCHITECTURES[self.architecture]
 
     def exact_counts(self):
         """True when a sibling llama-tokenize counts tokens exactly."""
@@ -189,7 +229,7 @@ class DiffusionModel:
 
     def generate(self, system, prompt, *, max_tokens=256, steps=None, on_frame=None, cancel=None):
         """Denoise one reply. on_frame(step, steps, text) sees each visual frame."""
-        steps = steps or max(8, max_tokens // 2)
+        steps = steps or self.preset.steps(max_tokens)
         with tempfile.TemporaryDirectory(prefix="kilix-chat-") as folder:
             scratch = Path(folder)
             (scratch / "prompt.txt").write_text(prompt, encoding="utf-8")
@@ -202,7 +242,7 @@ class DiffusionModel:
             args = [str(self.binary), "-m", str(self.path), "-f", str(scratch / "prompt.txt"),
                     "-c", str(length), "-b", str(length), "-ub", str(length),
                     "--diffusion-steps", str(steps), "--diffusion-eps", "0.001",
-                    "--diffusion-algorithm", str(ARCHITECTURES[self.architecture]),
+                    "--diffusion-algorithm", str(self.algorithm),
                     "--temp", TEMPERATURE, "--seed", "0", "-ngl", "99",
                     "--log-file", str(log), "--no-log-prefix", "--no-log-timestamps", "--log-colors", "off"]
             if system:

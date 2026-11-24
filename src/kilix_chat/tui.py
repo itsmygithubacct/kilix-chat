@@ -89,6 +89,10 @@ class Chat:
         self.messages = []
         self.info = None
         self.status = f"Chatting with {self.model.name} ({self.model.kind})."
+        preset = getattr(self.model.backend, "preset", None)
+        if preset is not None and preset.name != "default":
+            self.status += (f" {preset.name} preset: {preset.steps(self.length)} steps for "
+                            f"{self.length} tokens (/steps changes it).")
         return True
 
     def switch(self, spec):

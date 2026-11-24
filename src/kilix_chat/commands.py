@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 from typing import Callable
 
-from kilix_chat import memory
+from kilix_chat import diffusion, memory
 
 MIN_LENGTH, MAX_LENGTH = 8, 16384
 MAX_STEPS = 4096
@@ -132,7 +132,14 @@ def _length(chat, arg):
 
 def _steps(chat, arg):
     if not arg:
-        shown = chat.steps or f"automatic (half the reply length, {max(8, chat.length // 2)} now)"
+        if chat.steps:
+            shown = chat.steps
+        elif chat.model and chat.model.diffusion:
+            preset = chat.model.backend.preset
+            shown = (f"automatic ({preset.steps(chat.length)} now: the reply length / {preset.divisor}"
+                     + (f", the {preset.name} preset)" if preset is not diffusion.DEFAULT_PRESET else ")"))
+        else:
+            shown = "automatic"
         chat.status = f"Diffusion steps: {shown}. /steps N or /steps auto changes it."
         return
     chat.steps = None if arg.lower() == "auto" else _number(arg, 1, MAX_STEPS, "The step count")

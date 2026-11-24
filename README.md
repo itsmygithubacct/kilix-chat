@@ -246,6 +246,69 @@ replies kept (`--fast` is `-b 1`), `-s N` the most sentences,
 sweep covers (0 skips it), `--judge MODEL` a larger decision model for the
 final choice, and `--no-learn` leaves the usage counts alone.
 
+### Words, tokens or letters
+
+`-u`/`--unit` sets what one choice adds to the reply. In kilix-chat the
+model specs `d3-talk-tokens:NAME`, `d3-talk-letters:NAME` and
+`d3-talk-mixed:NAME` open a decision model with that unit.
+
+```sh
+./d3-talk --unit letters --show "Hi, I am Zorblat. What is my name?"
+./d3-talk --unit tokens -v "What is the capital of France?"
+./d3-talk --unit mixed "How are you today?"
+./kilix-chat --model d3-talk-letters:d3:2b
+```
+
+- `words` (the default) is everything above.
+- `letters`: each step offers the letters that continue some word from the
+  letters chosen so far, and "the word ends here" when they already spell
+  one. A letter that leaves only one word to spell finishes it at once.
+- `tokens`: the same with the pieces d3's own tokenizer (Qwen3.5's byte-level
+  BPE) cuts words into: " Paris" is one token, " photosynthesis" is
+  " photos" + "ynthesis". At most 40 tokens are offered per step, the
+  likeliest first. The tokenizer's `merges.txt` (3.4 MB, from the public
+  `vllm-sr/d3-nano` repository) is downloaded on first use into the data
+  directory as `d3-merges.txt`; without it, tokens are pieces of three
+  letters, and `-v` says so.
+- `mixed`: every step offers whole words, tokens and letters together. At a
+  word's start these are the three word groups above, then the likeliest
+  first tokens, then the likeliest first letters; inside a word, the words
+  it can still become, then the tokens and the letters that continue it.
+  The model may change unit at any step.
+
+The words that can be spelled are those of the lexicon, the topic words and
+the words of your message, so a name or a number you wrote can be spelled
+back ("It is Zorblat.", "It is 4417."). `--any-letter` also offers, after
+the first word of a sentence, letters and digits that continue no known
+word, at the cost of more questions per letter. A sentence still opens on a
+grammar word. An unfinished word is shown to the model with a hyphen ("It
+is Par-"), with a capital when only names begin that way, and the whole-
+sentence ranking compares partial replies that end mid-word like any other.
+The word limit counts finished words; a reply that runs out of steps
+finishes its last word if it is one and drops it if not. `--show` prints the
+reply after every step and `-v` the choices at every step. Only known words
+are learned: a word spelled from your message is never offered later as a
+word.
+
+Words stay the default. Measured 2026-11-24 with `d3:2b` on 30 test
+messages (replies graded 0-4 for grammar and answering by a second model),
+and on 8 more whose answer repeats a name or number from the message:
+
+| Unit | Questions | Prompt tokens | Seconds (laptop cost) | Grade /4 | Name or number repeated |
+|---|---:|---:|---:|---:|---:|
+| words | 73 | 27,000 | 9 | 2.53 | 0 of 8 |
+| tokens | 78 | 29,000 | 10 | 2.40 | 7 of 8 |
+| letters | 150 | 44,000 | 15 | 0.60 | 5 of 8 |
+| mixed | 93 | 35,000 | 12 | 2.60 | 8 of 8 |
+
+Mixed and tokens reply about as well as words (no difference a sign test
+can tell on 30 messages). In mixed the model takes a whole word 96% of the
+time, and the message's own names are offered whole with the topic words,
+which is why it repeats them ("It's Quexton Kentucky."). Letters are much
+worse: the
+model picks the right next letter about half the time, so it rarely spells
+the word it meant, and replies come out as invented words.
+
 Word and word-pair frequencies come from Peter Norvig's
 [n-gram lists](https://norvig.com/ngrams/) (`count_1w.txt` and
 `count_2w.txt`, 10 MB together). They are downloaded on first use into

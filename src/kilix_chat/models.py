@@ -9,6 +9,8 @@ from kilix_chat import d3talk, diffusion, ollama, prompt
 OLLAMA_PREFIX = "ollama:"
 D3TALK_PREFIX = "d3-talk:"
 D3TALK_FAST_PREFIX = "d3-talk-fast:"    # one partial reply instead of two
+# d3-talk-tokens:NAME, d3-talk-letters:NAME, d3-talk-mixed:NAME: the unit each choice adds
+D3TALK_UNIT_PREFIXES = {f"d3-talk-{unit}:": unit for unit in d3talk.UNITS if unit != "words"}
 
 
 def catalog():
@@ -69,6 +71,9 @@ class Model:
             self.backend = d3talk.D3TalkModel(spec[len(D3TALK_PREFIX):])
         elif spec.startswith(D3TALK_FAST_PREFIX):
             self.backend = d3talk.D3TalkModel(spec[len(D3TALK_FAST_PREFIX):], fast=True)
+        elif spec.split(":", 1)[0] + ":" in D3TALK_UNIT_PREFIXES:
+            prefix = spec.split(":", 1)[0] + ":"
+            self.backend = d3talk.D3TalkModel(spec[len(prefix):], unit=D3TALK_UNIT_PREFIXES[prefix])
         else:
             self.backend = diffusion.DiffusionModel(spec, device=device)
         self.name = self.backend.name

@@ -902,6 +902,9 @@ class OllamaContextTest(unittest.TestCase):
 WORDS_1W = "the\t90\nof\t80\nis\t70\nit\t60\na\t50\nyou\t45\ncapital\t40\nfrance\t30\nparis\t20\ncity\t10\napple\t9\nwww\t8\nxq\t7\n"
 WORDS_2W = "it is\t900\nis the\t800\nthe capital\t50\ncapital of\t40\nis a\t30\n"
 WORD_LIST = "the\nof\nis\nit\na\nyou\ncapital\ncity\napple\nwww\nxq\nParis\nFrance\n"
+# A few of d3's merges, in rank order (byte-level: "Ġ" is a space). " Paris" is " Par" + "is"; " is" needs
+# "i s" before "Ġ i", or it would be " i" + "s".
+MERGES = "Ġ P\na r\nĠP ar\ni s\nĠ i\nĠi t\nĠ is\n"
 
 
 class D3TalkTest(Fixture):
@@ -940,7 +943,7 @@ class D3TalkTest(Fixture):
                 def weight(key, text):
                     if key == "finished" or (not text and "paris" in key.split()):
                         return 50       # stop after one sentence; "paris" is the topic word
-                    shown = text.removesuffix(" ...")
+                    shown = text.removesuffix(" ...").removesuffix(d3talk.PARTIAL)    # "It is Par-" is on its way
                     return 1 + 10 * len(shown) if shown and test.wanted.startswith(shown) else 1
                 weights = {key: weight(key, text) for key, text in options.items()}
                 total = sum(weights.values())
@@ -1097,6 +1100,148 @@ class D3TalkTest(Fixture):
         self.assertEqual(sorted(path.name for path in self.data.iterdir()),
                          ["count_1w.txt", "count_2w.txt", "usage.tsv"])
 
+    def unit_questions(self):
+        """The options of every composing question asked so far, which are then forgotten."""
+        asked = [body["questions"]["q"] for _, body in self.asked]
+        del self.asked[:]
+        return [question["criteria"] for question in asked if question["instructions"] == d3talk.STEP_QUESTION]
+
+    def test_d3s_tokenizer_cuts_words_by_the_rank_of_its_merges(self):
+        (self.data / "d3-merges.txt").write_text(MERGES)
+        tokenizer = d3talk.Tokenizer(self.data / "d3-merges.txt")
+        self.assertEqual(tokenizer.pieces(" Paris"), [" Par", "is"])
+        self.assertEqual(tokenizer.pieces(" is"), [" is"])
+        self.assertEqual(tokenizer.pieces(" ist"), [" is", "t"])     # "i s" outranks "Ġ i", though it comes later
+        self.assertEqual(tokenizer.pieces(" don't 42"), [" ", "d", "o", "n", "'", "t", " ", "4", "2"])
+        words = d3talk.lexicon()
+        self.assertEqual((words.pieces("paris"), words.pieces("it"), words.pieces("is")), (("par", "is"), ("it",), ("is",)))
+        self.assertEqual(d3talk.word_pieces(d3talk.Pieces(), "capital", "capital"), ("cap", "ita", "l"))
+        # with no merges and no way to download them, tokens are pieces of three letters, and the reply says so
+        (self.data / "d3-merges.txt").unlink()
+        d3talk._lexicon.cache_clear()
+        lines = []
+        with patch.dict(d3talk.TOKENIZER, {"d3-merges.txt": "http://127.0.0.1:9/merges.txt"}):
+            talker = d3talk.Talker("d3:2b", d3talk.lexicon(), d3talk.Settings(unit="tokens", learn=False),
+                                   on_detail=lines.append)
+            self.assertEqual(talker.reply("What is the capital of France?", max_words=6), self.wanted)
+        self.assertEqual(talker.word_pieces("paris"), ("par", "is"))
+        self.assertTrue(any(line.strip().startswith("tokens are pieces of 3 letters: d3-talk could not download")
+                            for line in lines))
+        self.assertFalse((self.data / "d3-merges.txt").exists())
+
+    def test_letters_spell_the_reply_and_open_a_sentence_on_grammar(self):
+        model = models.Model("d3-talk-letters:d3:2b")
+        self.assertEqual((model.name, model.kind, model.backend.settings.unit), ("d3:2b", "d3-talk", "letters"))
+        shown = []
+        reply, _ = model.reply([{"role": "user", "content": "What is the capital of France?"}], max_tokens=6,
+                               on_partial=lambda text, step, steps: shown.append(text))
+        self.assertEqual((reply.text, reply.completion_tokens), (self.wanted, 4))
+        drafts = [text for text in shown if not text.startswith("(")]
+        # a word is spelled one letter at a time; an unfinished one has a hyphen, and the capital of the
+        # only word it can become
+        for draft in ("I-", "It", "It is", "It is P-", "It is Pa-", "It is Paris", self.wanted):
+            self.assertIn(draft, drafts)
+        questions = self.unit_questions()
+        first = questions[0]
+        self.assertEqual(sorted(first), sorted(set(first)))
+        self.assertTrue(all(len(key) == 2 and key.endswith("-") or key in ("a", "i") for key in first), first)
+        # a sentence opens on grammar, not on "paris"
+        opening = d3talk.Talker("d3:2b", d3talk.lexicon(), d3talk.Settings(unit="letters")).inventory([], ["paris"])
+        self.assertTrue("the" in opening and "paris" not in opening and "capital" not in opening)
+        paris = next(options for options in questions if "pa-" in options)
+        self.assertEqual(paris["pa-"], "It is Pa-")         # unfinished, so no " ..."
+        self.assertIn("paris", next(options for options in questions if any(k.startswith("pa") for k in options)
+                                    and "paris" in options))
+        # a spelled word is learned as a word
+        usage = (self.data / "usage.tsv").read_text()
+        self.assertIn("is\tparis\t1\t", usage)
+        self.assertNotIn("-", usage)
+        # the reply length counts words, and a sentence that runs out of them is closed
+        self.wanted = "It is the capital of France."
+        one = d3talk.Talker("d3:2b", d3talk.lexicon(), d3talk.Settings(unit="letters", beam=1, learn=False))
+        self.assertEqual(one.reply("And Paris?", max_words=3), "It is the.")
+
+    def test_tokens_are_whole_tokens_of_d3s_tokenizer(self):
+        (self.data / "d3-merges.txt").write_text(MERGES)
+        reply, _ = models.Model("d3-talk-tokens:d3:2b").reply(
+            [{"role": "user", "content": "What is the capital of France?"}], max_tokens=6)
+        self.assertEqual(reply.text, self.wanted)
+        questions = self.unit_questions()
+        self.assertIn("It is Par-", [options.get("par-") for options in questions])
+        self.assertFalse(any(key in options for options in questions for key in ("pa-", "pari-")))
+        self.assertIn("paris", [key for options in questions for key in options])     # " Par" then "is" ends it
+        # words of one token are offered whole
+        self.assertIn("is", [key for options in questions for key in options])
+
+    def test_mixed_offers_words_tokens_and_letters_together(self):
+        (self.data / "d3-merges.txt").write_text(MERGES)
+        lines = []
+        talker = d3talk.Talker("d3:2b", d3talk.lexicon(), d3talk.Settings(unit="mixed", learn=False),
+                               on_detail=lines.append)
+        self.assertEqual(talker.reply("What is the capital of France?", max_words=6), self.wanted)
+        questions = self.unit_questions()
+        keys = {key for options in questions for key in options}
+        self.assertTrue({"paris", "par-", "p-"} <= keys, keys)
+        # at a word's start, whole words come first, then tokens, then letters
+        groups = talker.unit_groups(["it", "is"], ["paris"])
+        words = talker.groups(["it", "is"], ["paris"])
+        self.assertEqual(groups[:len(words)], words)
+        self.assertIn("paris", words[-1])
+        tokens, letters = groups[len(words):]
+        self.assertIn("par-", tokens)
+        self.assertTrue(letters and all(len(key) == 2 and key not in tokens for key in letters), letters)
+        # inside a word: the words it can become, the tokens and the letters that continue it
+        self.assertEqual(talker.unit_groups(["it", "is", "pa-"], ["paris"]), [["paris"], ["par-"]])
+        self.assertTrue(any("->" in line for line in lines))
+
+    def test_the_messages_own_words_can_be_spelled_but_are_not_learned(self):
+        self.wanted = "It is Zorblat."
+        message = [{"role": "user", "content": "I am Zorblat. Who am I?"}]
+        words, _ = models.Model("d3-talk:d3:2b").reply(message, max_tokens=6)
+        self.assertNotEqual(words.text, self.wanted)        # no word list holds it
+        (self.data / "usage.tsv").unlink()
+        shown = []
+        reply, _ = models.Model("d3-talk-letters:d3:2b").reply(
+            message, max_tokens=6, on_partial=lambda text, step, steps: shown.append(text))
+        self.assertEqual(reply.text, self.wanted)
+        self.assertIn("It is Zo-", shown)       # only "Zorblat" begins so: its capital shows
+        usage = (self.data / "usage.tsv").read_text()
+        self.assertNotIn("zorblat", usage.lower())
+        self.assertIn("<S>\tit\t1\t", usage)
+        # a number from the message too
+        self.wanted = "It is 4417."
+        reply, _ = models.Model("d3-talk-letters:d3:2b").reply(
+            [{"role": "user", "content": "My flight is 4417. Which flight?"}], max_tokens=6)
+        self.assertEqual(reply.text, self.wanted)
+        # letters that spell no known word, when asked for
+        self.wanted = "It is xq."
+        talker = d3talk.Talker("d3:2b", d3talk.lexicon(), d3talk.Settings(unit="letters", learn=False))
+        self.assertNotEqual(talker.reply("Hi?", max_words=4), self.wanted)      # no known word has an x
+        free = d3talk.Talker("d3:2b", d3talk.lexicon(), d3talk.Settings(unit="letters", learn=False, any_letter=True))
+        self.assertEqual(free.reply("Hi?", max_words=4), self.wanted)
+
+    def test_a_words_start_is_weighed_as_if_every_word_were_counted(self):
+        (self.data / "d3-merges.txt").write_text(MERGES)
+        for unit in ("letters", "tokens"):
+            talker = d3talk.Talker("d3:2b", d3talk.lexicon(), d3talk.Settings(unit=unit, learn=False))
+            talker.prepare("Is it Zorblat?", [])
+            for done, topics in ((["it", "is"], ["paris", "city"]), (["the", "city", "is", "the"], ["city"]),
+                                 (["it", "is", "the", "capital", "of"], [])):
+                weights = talker.inventory(done, topics)
+                sums = {}
+                for word in weights:
+                    entry = sums.setdefault(talker.grown(word, 0, unit), [0.0, 0])
+                    entry[0] += weights[word]
+                    entry[1] += 1
+                expected = [grown if count == 1 and grown in weights else grown + d3talk.PARTIAL
+                            for grown, (_, count) in sorted(sums.items(), key=lambda item: (-item[1][0], item[0]))]
+                self.assertEqual(talker.continuations(done, "", topics, unit), expected, (unit, done))
+                self.assertEqual(talker.continuations(done, "", topics, unit, 3), expected[:3], (unit, done))
+                self.assertNotIn(done[-1], expected)        # never the same word twice in a row
+        # what follows the word before counts: "is a" is a common pair, so "a" comes before "it"
+        order = talker.continuations(["it", "is"], "", [], "letters")
+        self.assertLess(order.index("a-"), order.index("i-"))
+
     def test_the_commands_and_the_window_talk_with_a_decision_model(self):
         asked = subprocess.run([PROJECT / "kilix-chat", "--model", "d3-talk:d3:2b", "--max-tokens", "6", "ask",
                                 "What is the capital of France?"], capture_output=True, text=True, timeout=60)
@@ -1118,6 +1263,15 @@ class D3TalkTest(Fixture):
             self.assertEqual((ran.returncode, ran.stdout), (0, self.wanted + "\n"))
             questions.append(int(ran.stderr.rsplit(" words from ", 1)[1].split()[0]))
         self.assertLess(questions[1], questions[0])        # --fast keeps one partial reply
+        spelled = subprocess.run(talk + ["--unit", "letters", "--show", "-v", "What is the capital of France?"],
+                                 capture_output=True, text=True, timeout=60)
+        self.assertEqual(spelled.returncode, 0, spelled.stderr)
+        self.assertIn("It is Pa-", spelled.stdout.splitlines())
+        self.assertEqual(spelled.stdout.splitlines()[-1], self.wanted)
+        self.assertRegex(spelled.stderr, r"4 words in \d+ steps of letters from \d+ questions")
+        self.assertIn("It is Pa- -> ", spelled.stderr)
+        wrong = subprocess.run(talk + ["--unit", "syllables", "hi"], capture_output=True, text=True, timeout=60)
+        self.assertEqual(wrong.returncode, 2)
         learned = subprocess.run([PROJECT / "d3-talk", "--usage"], capture_output=True, text=True, timeout=60)
         self.assertIn("is\tparis\t1\t", learned.stdout)       # from `ask`; --no-learn added nothing
         self.assertEqual(len(learned.stdout.splitlines()), 5)

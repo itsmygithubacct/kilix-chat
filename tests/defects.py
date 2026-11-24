@@ -43,10 +43,41 @@ DEFECTS = [
      S + "prompt.py", 'if call and call["function"]["name"] in names:\n            calls.append(call)',
      "if call:\n            calls.append(call)"),
     ("the server ignores its reply length cap",
-     S + "server.py", "budget = max(16, min(int(requested), max_tokens_cap))", "budget = max(16, int(requested))"),
+     S + "server.py", "return max(16, min(int(requested), max_tokens_cap))", "return max(16, int(requested))"),
     ("streamed tool calls end as an ordinary stop",
      S + "server.py", 'yield chunk({}, "tool_calls" if calls else "stop", usage=usage(reply))',
      'yield chunk({}, "stop", usage=usage(reply))'),
+    ("a slow Ollama stream sends nothing until the reply is done",
+     S + "server.py", '''                    self.line({"model": alias, "created_at": now(),
+                               "message": {"role": "assistant", "content": ""}, "done": False})''', "                    pass"),
+    ("the Ollama done line has no done_reason",
+     S + "server.py", '"done": True, "done_reason": reason,', '"done": True,'),
+    ("Ollama requests for any model name are answered",
+     S + "server.py", "            if name not in served_names(alias):", "            if False:"),
+    ("NAME:latest is not the served model",
+     S + "server.py", '{alias} if ":" in alias else {alias, alias + ":latest"}', "{alias}"),
+    ("Ollama's num_predict is ignored",
+     S + "server.py", "tokens = budget(requested if isinstance(requested, int) and requested > 0 else max_tokens_cap)",
+     "tokens = budget(max_tokens_cap)"),
+    ("an Ollama chat without stream is not streamed",
+     S + "server.py", 'stream = body.get("stream", True) is not False', 'stream = bool(body.get("stream"))'),
+    ("a failed Ollama stream ends without an error line",
+     S + "server.py", '                    self.line({"error": result["error"]})\n', ""),
+    ("an unexpected failure drops the Ollama client",
+     S + "server.py", "                except Exception as error:   # a bug still answers the client, never drops it\n",
+     "                except ZeroDivisionError as error:\n"),
+    ("a client that leaves does not stop the reply",
+     S + "server.py", "                cancel.set()\n                worker.join()", "                worker.join()"),
+    ("Ollama tool call arguments are a JSON string",
+     S + "server.py", '"arguments": json.loads(c["function"]["arguments"])}}', '"arguments": c["function"]["arguments"]}}'),
+    ("/api/tags lists the file's model name, not the alias",
+     S + "server.py", 'return {"name": alias, "model": alias, "size": size,', 'return {"name": model.name, "model": alias, "size": size,'),
+    ("serve binds a non-loopback address",
+     S + "server.py", "    if not is_loopback(host):\n        raise", "    if False:\n        raise"),
+    ("the serve command accepts a non-loopback host",
+     S + "cli.py", "            if not is_loopback(args.host):", "            if False:"),
+    ("an Ollama tool result loses its tool name",
+     S + "prompt.py", 'message.get("name") or message.get("tool_name") or', 'message.get("name") or'),
     ("Ollama replies ignore the length setting",
      S + "ollama.py", '"options": {"num_predict": max_tokens}', '"options": {}'),
     ("a failed reply leaves the unanswered message",
@@ -129,10 +160,15 @@ DEFECTS = [
 
 
 def suite(root):
-    return subprocess.run([sys.executable, "-B", "-m", "unittest", "discover", "-s", "tests"], cwd=root,
-                          env={"PYTHONDONTWRITEBYTECODE": "1", "PATH": "/usr/bin:/bin", "HOME": str(root),
-                               "TMPDIR": tempfile.gettempdir()},
-                          capture_output=True, text=True, timeout=600).returncode
+    """The suite's exit status; a run that hangs counts as red."""
+    try:
+        return subprocess.run([sys.executable, "-B", "-m", "unittest", "discover", "-s", "tests"], cwd=root,
+                              env={"PYTHONDONTWRITEBYTECODE": "1", "PATH": "/usr/bin:/bin", "HOME": str(root),
+                                   "TMPDIR": tempfile.gettempdir()},
+                              capture_output=True, text=True, timeout=300).returncode
+    except subprocess.TimeoutExpired:
+        print("      (the suite timed out)")
+        return 124
 
 
 def main():

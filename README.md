@@ -142,13 +142,43 @@ Dream-v0-Instruct-7B and Dream-Coder-v0-Instruct-7B (4.7 GB each). Build the
 tool from llama.cpp with `cmake -DGGML_VULKAN=ON` (or CUDA) and
 `cmake --build build --target llama-diffusion-cli llama-tokenize`.
 
-## Serving a coding agent
+## Serving a coding agent or a chat client
 
-`kilix-chat serve` answers `GET /health`, `GET /v1/models` and
-`POST /v1/chat/completions`, streamed or not, one request at a time. Offered
-tools are described in the system prompt. The model calls one by replying
+`kilix-chat serve` listens on loopback only (127.0.0.1, ::1 or localhost) and
+answers in two dialects on one port, one request at a time.
+
+OpenAI, for coding agents: `GET /health`, `GET /v1/models` and
+`POST /v1/chat/completions`, streamed or not. Offered tools are described in
+the system prompt. The model calls one by replying
 `<tool_call>{"name": ..., "arguments": {...}}</tool_call>`, which becomes an
 OpenAI `tool_calls` entry. Calls to tools that were not offered are ignored.
+
+Ollama, for chat clients such as Kilix Avatar
+(`--ollama http://127.0.0.1:PORT --model ALIAS`):
+
+- `GET /api/tags` lists the one served model under its alias, with the GGUF's
+  size, a digest of its path, size and modification time, and its
+  architecture as the family.
+- `POST /api/chat` streams NDJSON by default, as Ollama does, or answers once
+  with `"stream": false`. The reply arrives whole, followed by a `done` line
+  with `done_reason: "stop"` and Ollama's counts and durations. While a
+  diffusion reply denoises, the stream carries an empty message every 5
+  seconds so a client's read timeout does not end it. A client that
+  disconnects stops the reply. A failure mid-stream is an `{"error": ...}`
+  line. `options.num_predict` sets the reply length, up to `--max-tokens`.
+  Tool calls come back as Ollama `tool_calls` with object arguments.
+- `POST /api/pull` of the served name, or `NAME:latest`, succeeds without
+  downloading anything.
+- `GET /api/version` gives kilix-chat's version.
+- Any other model name is HTTP 404 with an Ollama-style `{"error": ...}`
+  that names the served model.
+
+```sh
+./kilix-chat --model ~/.local/share/puzzllm/diffusion/d3LLM_LLaDA.Q4_K_M.gguf \
+    --device Vulkan1 --max-tokens 256 serve --port 11435 --alias d3llm
+# then, for example: ./build/kilix-avatar --chat --ollama http://127.0.0.1:11435 --model d3llm
+```
+
 `--max-tokens` caps every reply (default 256), whatever a client asks for.
 Diffusion models are not trained for tool use, and every turn denoises the
 whole conversation again, so expect slow and unreliable agent turns.

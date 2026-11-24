@@ -19,7 +19,7 @@ def main(argv=None):
     ask = sub.add_parser("ask", help="print one reply to one message")
     ask.add_argument("message")
     ask.add_argument("--system", default="")
-    serve = sub.add_parser("serve", help="serve the model as an OpenAI-compatible endpoint")
+    serve = sub.add_parser("serve", help="serve the model to OpenAI and Ollama clients on loopback")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8765)
     serve.add_argument("--alias", help="model ID reported to clients (default: the file name)")
@@ -32,6 +32,10 @@ def main(argv=None):
     if args.command in ("ask", "serve"):
         if not args.model:
             parser.error(f"{args.command} needs --model")
+        if args.command == "serve":
+            from kilix_chat.server import is_loopback
+            if not is_loopback(args.host):
+                parser.error(f"serve listens on loopback only (127.0.0.1, ::1 or localhost), not {args.host}")
         try:
             model = Model(args.model, device=args.device)
         except (OSError, RuntimeError, ValueError) as error:
@@ -56,6 +60,9 @@ def main(argv=None):
                        max_tokens_cap=args.max_tokens, log=lambda line: print(line, file=sys.stderr), ready=ready)
         except KeyboardInterrupt:
             pass
+        except OSError as error:
+            print(f"kilix-chat: could not serve on {args.host}:{args.port} ({error})", file=sys.stderr)
+            return 1
         return 0
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         parser.error("the chat window needs a terminal; use `kilix-chat ask` in scripts")

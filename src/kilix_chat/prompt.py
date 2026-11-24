@@ -63,7 +63,7 @@ def _line(message):
         calls = "\n".join(_call_text(c) for c in message.get("tool_calls") or [])
         return "Assistant: " + "\n".join(filter(None, (content, calls)))
     if role == "tool":
-        name = message.get("name") or message.get("tool_call_id") or "tool"
+        name = message.get("name") or message.get("tool_name") or message.get("tool_call_id") or "tool"
         return f"Tool result ({name}):\n{content}"
     return "User: " + content
 

@@ -2,21 +2,25 @@
 """kilix-chat offline: GGUF metadata, prompts, tool calls, the diffusion
 runner against a stand-in llama-diffusion-cli, the server, Ollama, and the
 chat window's keys, slash commands and memory."""
+import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import socket
 import struct
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 from urllib.request import Request, urlopen
 
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / "src"))
+import kilix_chat  # noqa: E402
 from kilix_chat import commands, diffusion, gguf, memory, models, ollama, prompt, server, tui  # noqa: E402
 
 
@@ -37,7 +41,7 @@ def gguf_bytes(arch, name="Tiny", context=None, extra=()):
 
 
 FAKE_CLI = r'''#!/usr/bin/env python3
-import json, os, sys
+import json, os, sys, time
 args = sys.argv[1:]
 prompt = open(args[args.index('-f') + 1]).read()
 system = args[args.index('-sys') + 1] if '-sys' in args else ''
@@ -56,6 +60,9 @@ if os.environ.get('CHAT_FAIL') == 'memory':
 if os.environ.get('CHAT_FAIL'):
     entry('error: failed to load model\n')
     sys.exit(1)
+if os.environ.get('CHAT_SLEEP'):
+    time.sleep(float(os.environ['CHAT_SLEEP']))
+    open(os.environ['CHAT_CALLS'] + '.finished', 'a').close()
 reply = os.environ.get('CHAT_REPLY') or ('Echo: ' + prompt.splitlines()[-1])
 steps = int(args[args.index('--diffusion-steps') + 1])
 if '--diffusion-visual' in args:
@@ -95,7 +102,7 @@ class Fixture(unittest.TestCase):
         self.calls = self.root / "calls"
         env = {"KILIX_CHAT_MODELS": str(self.models), "CHAT_CALLS": str(self.calls), "PATH": "/usr/bin:/bin",
                "KILIX_CHAT_DIFFUSION_CLI": "", "PUZZLLM_DIFFUSION_CLI": "", "KILIX_CHAT_DEVICE": "",
-               "PUZZLLM_GPU": "", "OLLAMA_HOST": "127.0.0.1:9", "CHAT_REPLY": "", "CHAT_FAIL": "",
+               "PUZZLLM_GPU": "", "OLLAMA_HOST": "127.0.0.1:9", "CHAT_REPLY": "", "CHAT_FAIL": "", "CHAT_SLEEP": "",
                "XDG_DATA_HOME": str(self.root / "data")}
         patcher = patch.dict(os.environ, env)
         patcher.start()
@@ -226,7 +233,8 @@ class DiffusionTest(Fixture):
         self.assertEqual(args[args.index("-ub") + 1], str(len("\ncafé".encode()) + 64 + 32))
 
 
-class ServerTest(Fixture):
+class Served(Fixture):
+    """Starts `kilix-chat serve` over the stand-in model."""
     def start(self, cap=512):
         model = models.Model(str(self.dream))
         ready = threading.Event()
@@ -247,6 +255,8 @@ class ServerTest(Fixture):
         with urlopen(request, timeout=10) as response:
             return response.read().decode()
 
+
+class ServerTest(Served):
     def test_health_models_and_plain_completion(self):
         url = self.start(cap=100)
         with urlopen(url + "/health", timeout=5) as response:
@@ -281,6 +291,152 @@ class ServerTest(Fixture):
             self.post(url, {"messages": [{"role": "user", "content": "x"}]})
         self.assertEqual(caught.exception.code, 500)
         self.assertIn("failed to load model", json.loads(caught.exception.read())["error"]["message"])
+
+
+class OllamaServeTest(Served):
+    """The Ollama dialect, requested the way Kilix Avatar's LocalOllama does."""
+    AVATAR_OPTIONS = {"num_ctx": 8192, "num_predict": 2048}
+
+    def request(self, url, method, path, body=None):
+        """(status, content type, parsed NDJSON or JSON lines) over http.client, as Avatar reads them."""
+        port = int(url.rsplit(":", 1)[1])
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        data = json.dumps(body).encode() if body is not None else None
+        connection.request(method, path, data, {"Content-Type": "application/json"} if data else {})
+        response = connection.getresponse()
+        lines = []
+        while True:
+            line = response.readline(65537)
+            if not line:
+                break
+            if line.strip():
+                lines.append(json.loads(line))
+        connection.close()
+        return response.status, response.getheader("Content-Type"), lines
+
+    def chat(self, url, model="dream-test", **extra):
+        body = {"model": model, "messages": [{"role": "system", "content": "Be Kilix."},
+                                             {"role": "user", "content": "hi"}],
+                "stream": True, "think": False, "keep_alive": "5m", "options": dict(self.AVATAR_OPTIONS)}
+        body.update(extra)
+        return self.request(url, "POST", "/api/chat", body)
+
+    def test_tags_version_and_pull_answer_only_for_the_served_model(self):
+        url = self.start()
+        status, kind, (tags,) = self.request(url, "GET", "/api/tags")
+        record, = tags["models"]
+        self.assertEqual((status, kind, record["name"], record["model"], record["size"]),
+                         (200, "application/json", "dream-test", "dream-test", self.dream.stat().st_size))
+        self.assertRegex(record["digest"], r"^[0-9a-f]{64}$")
+        self.assertEqual((record["details"]["family"], record["details"]["format"]), ("dream", "gguf"))
+        self.assertTrue(record["modified_at"].endswith("Z"))
+        self.assertEqual(self.request(url, "GET", "/api/version")[2], [{"version": kilix_chat.__version__}])
+        for name in ("dream-test", "dream-test:latest"):
+            self.assertEqual(self.request(url, "POST", "/api/pull", {"model": name, "stream": True}),
+                             (200, "application/x-ndjson", [{"status": "success"}]))
+        self.assertEqual(self.request(url, "POST", "/api/pull", {"name": "dream-test", "stream": False})[2],
+                         [{"status": "success"}])
+        for path in ("/api/pull", "/api/chat"):
+            status, _, (error,) = self.request(url, "POST", path, {"model": "llama3", "stream": True,
+                                                                  "messages": [{"role": "user", "content": "x"}]})
+            self.assertEqual(status, 404, path)
+            self.assertEqual(error, {"error": 'model "llama3" not found; this kilix-chat serves only "dream-test" '
+                                              "and does not download models"})
+        self.assertEqual(self.request(url, "POST", "/api/chat", {"messages": []})[:2], (400, "application/json"))
+        self.assertEqual(self.runs(), [])
+
+    def test_chat_streams_ndjson_with_ollama_done_fields(self):
+        url = self.start(cap=100)
+        status, kind, lines = self.chat(url)
+        self.assertEqual((status, kind), (200, "application/x-ndjson"))
+        self.assertEqual("".join(line["message"]["content"] for line in lines), "Echo: hi")
+        self.assertTrue(all(line["model"] == "dream-test" and line["done"] is (line is lines[-1]) for line in lines))
+        done = lines[-1]
+        self.assertEqual((done["done_reason"], done["prompt_eval_count"], done["eval_count"]), ("stop", 7 + 64, 100))
+        self.assertIsInstance(done["total_duration"], int)
+        args, system, text, _ = self.runs()[-1]
+        self.assertEqual((system, text, args[args.index("-ub") + 1]), ("Be Kilix.", "hi", str(7 + 64 + 100)))
+        self.chat(url, options={"num_predict": 20})
+        self.assertEqual(self.runs()[-1][0][self.runs()[-1][0].index("-ub") + 1], str(7 + 64 + 20))
+        unstreamed = self.chat(url, stream=False)
+        self.assertEqual((unstreamed[1], len(unstreamed[2])), ("application/json", 1))
+        self.assertEqual((unstreamed[2][0]["message"]["content"], unstreamed[2][0]["done"]), ("Echo: hi", True))
+        body = {"model": "dream-test", "messages": [{"role": "user", "content": "default"}]}
+        status, kind, lines = self.request(url, "POST", "/api/chat", body)
+        self.assertEqual((kind, lines[-1]["done"], lines[-2]["message"]["content"]),
+                         ("application/x-ndjson", True, "Echo: default"))
+
+    def test_a_slow_reply_keeps_the_stream_alive_and_a_failure_is_an_error_line(self):
+        os.environ["CHAT_SLEEP"] = "0.6"
+        url = self.start()
+        with patch.object(server, "KEEPALIVE_SECONDS", 0.1):
+            lines = self.chat(url)[2]
+        alive = [line for line in lines[:-2] if line["message"]["content"] == "" and line["done"] is False]
+        self.assertGreaterEqual(len(alive), 3)
+        self.assertEqual(lines[-2]["message"]["content"], "Echo: hi")
+        os.environ.update(CHAT_SLEEP="", CHAT_FAIL="1")
+        url = self.start()   # the model reads its environment when it opens
+        status, _, lines = self.chat(url)
+        self.assertEqual(status, 200)
+        self.assertIn("failed to load model", lines[-1]["error"])
+        status, _, (error,) = self.chat(url, stream=False)
+        self.assertEqual(status, 500)
+        self.assertIn("failed to load model", error["error"])
+
+    def test_a_client_that_leaves_stops_the_reply(self):
+        os.environ["CHAT_SLEEP"] = "3"
+        url = self.start()
+        body = json.dumps({"model": "dream-test", "messages": [{"role": "user", "content": "x"}]}).encode()
+        with patch.object(server, "KEEPALIVE_SECONDS", 0.05):
+            client = socket.create_connection(("127.0.0.1", int(url.rsplit(":", 1)[1])), timeout=10)
+            client.sendall(b"POST /api/chat HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                           + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+            received = b""
+            while b'"done": false' not in received:
+                chunk = client.recv(4096)
+                if not chunk:
+                    self.fail(f"the server closed the stream: {received!r}")
+                received += chunk
+            client.close()
+            time.sleep(4)
+        self.assertEqual(len(self.runs()), 1)
+        self.assertFalse(Path(str(self.calls) + ".finished").exists())
+        os.environ["CHAT_SLEEP"] = ""
+        self.assertEqual(self.chat(url)[2][-2]["message"]["content"], "Echo: hi")
+
+    def test_an_unexpected_failure_is_still_answered(self):
+        url = self.start()
+        with patch.object(models.Model, "reply", side_effect=KeyError("boom")):
+            status, _, lines = self.chat(url)
+            self.assertEqual((status, lines[-1]), (200, {"error": "kilix-chat failed: KeyError: 'boom'"}))
+            status, _, (error,) = self.chat(url, stream=False)
+            self.assertEqual((status, error), (500, {"error": "kilix-chat failed: KeyError: 'boom'"}))
+
+    def test_tool_calls_take_ollama_shapes(self):
+        os.environ["CHAT_REPLY"] = '<tool_call>{"name": "read", "arguments": {"path": "GOAL.md"}}</tool_call>'
+        url = self.start()
+        tools = [{"type": "function", "function": {"name": "read", "parameters": {}}}]
+        lines = self.chat(url, tools=tools, messages=[
+            {"role": "user", "content": "go"},
+            {"role": "tool", "tool_name": "read", "content": "a.txt"}])[2]
+        self.assertEqual(lines[-2]["message"]["tool_calls"], [{"function": {"name": "read",
+                                                                             "arguments": {"path": "GOAL.md"}}}])
+        self.assertIn("Tool result (read):\na.txt", self.runs()[-1][2])
+
+    def test_serve_listens_on_loopback_only(self):
+        for host in ("127.0.0.1", "127.0.0.2", "::1", "localhost"):
+            self.assertTrue(server.is_loopback(host), host)
+        for host in ("0.0.0.0", "192.168.1.2", "::", "example.org"):
+            self.assertFalse(server.is_loopback(host), host)
+        def bound(instance):
+            # Were it to bind, stop it at once so the test fails rather than hangs.
+            threading.Thread(target=instance.shutdown, daemon=True).start()
+        with self.assertRaisesRegex(ValueError, "loopback only"):
+            server.serve(models.Model(str(self.dream)), alias="x", host="0.0.0.0", port=0, ready=bound)
+        refused = subprocess.run([PROJECT / "kilix-chat", "--model", str(self.dream), "serve", "--host", "0.0.0.0"],
+                                 capture_output=True, text=True, timeout=20)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("serve listens on loopback only", refused.stderr)
 
 
 class OllamaTest(unittest.TestCase):

@@ -188,26 +188,33 @@ Ollama's decision models (`d3:2b`, `d3:4b`, `d3:9b`, `d3:27b`; upstream
 question to the model about some text, and the answer is a probability for
 every option offered. They are unrelated to d3LLM above, which is a
 diffusion model. Ollama refuses to chat with one, so the model picker lists
-each as `NAME  [d3-talk]`, and `d3-talk:NAME` opens it.
+each as `NAME  [d3-talk]`, and `d3-talk:NAME` opens it. `d3-talk-fast:NAME`
+opens it with one partial reply instead of two: about a third less waiting,
+and vaguer answers.
 
 d3-talk builds a reply out of multiple-choice questions, always offering the
 most-used words first:
 
-1. **Think.** The 4,000 most-used English words are swept in order of use,
-   100 to a question, and the model picks the words a good answer would
-   name. Five survive each question, the survivors compete, and the best 24
-   are the topic words, together with the content words of your message.
+1. **Think.** The 4,000 most-used English words are swept in order of use.
+   First they are shown ten to a line, 100 lines to a question, and the
+   model picks the lines that hold a word a good answer would name. Then
+   the 320 words of the best lines are shown 100 to a question, twelve
+   survive each, and the best 24 are the topic words, together with the
+   content words of your message. Sweeping lines first costs a third of the
+   prompt of sweeping every word, and found the needed word in 18 of 24
+   test questions against 19.
 2. **Compose.** The reply grows one word at a time. Each step asks about
    three groups of up to 14 choices: the words that most often follow the
    last word, the most-used grammar words, and the topic words. Each choice
    is shown to the model as the reply so far with that word added. The best
    two of every group meet in a final. A sentence has to open on a grammar
    word; when topic words could open one, replies read like headlines.
-3. **Compare.** Three partial replies are kept alive. After every word the
+3. **Compare.** Two partial replies are kept alive. After every word the
    model ranks them as whole sentences, which it does far better than it
-   picks single words. After a full stop it is asked whether the reply needs
-   another sentence, and a second sentence stays only if the model prefers
-   the reply with it.
+   picks single words, and the sentence is done as soon as the best one has
+   ended. After a full stop it is asked whether the reply needs another
+   sentence, and a second sentence stays only if the model prefers the
+   reply with it.
 4. **Learn.** Every word of the finished reply is counted with the word
    before it, and pairs the model uses often are offered earlier next time.
 
@@ -218,7 +225,7 @@ characters, and so are the last three exchanges.
 
 `kilix-chat --model d3-talk:d3:2b serve` serves it like any other model,
 so OpenAI and Ollama clients can chat with a decision model. The reported
-prompt tokens add up every question's prompt: about 41,000 for the reply
+prompt tokens add up every question's prompt: about 17,000 for the reply
 "It is Paris." A request that offers tools is refused, as it is for an
 Ollama model.
 
@@ -229,11 +236,12 @@ The same engine runs on its own as `d3-talk`:
 ./d3-talk                                      # one message per line
 ./d3-talk --show "Why is the sky blue?"        # the reply after every word, a line each
 ./d3-talk -v "How are you today?"              # the topic words and the choices at every step
+./d3-talk --fast "What is two plus two?"       # one partial reply instead of two
 ./d3-talk --usage                              # the word pairs it has used most
 ```
 
 `-m MODEL` names another decision model, `-b N` the number of partial
-replies kept (1 is fastest and much worse), `-s N` the most sentences,
+replies kept (`--fast` is `-b 1`), `-s N` the most sentences,
 `--max-words N` the most words in a sentence, `--vocab N` how many words the
 sweep covers (0 skips it), `--judge MODEL` a larger decision model for the
 final choice, and `--no-learn` leaves the usage counts alone.
@@ -250,14 +258,22 @@ word in the lists counts and names are not capitalised.
 What to expect, measured 2026-11-23 with `d3:2b` (Q8_0) on a Quadro RTX
 3000 (6 GB), which holds the whole model:
 
-- A question costs about 30 ms plus 0.27 ms per prompt token, and the model
-  reads the conversation and every option again for each question. Sending
-  questions in parallel, or several in one request, was no faster. A reply
-  takes about 90 to 250 questions and 10 to 30 seconds, of which the sweep
-  is 45 questions and about 7 seconds.
-- Short factual questions come out well ("It is Paris.", "I feel well
-  today.", "It's four total."). Open questions give vaguer sentences, and a
-  sentence can end unfinished. The wording changes from run to run.
+- A question costs about 17 ms plus 0.29 ms per prompt token, and the model
+  reads the conversation and every option again for each question, so the
+  prompt tokens are the cost. Sending questions in parallel, or several in
+  one request, was no faster. Over 30 test messages a reply took 69
+  questions and 26,000 prompt tokens on average, which is 5 to 15 seconds
+  at that cost (9 on average); the sweep is 9 of the questions and under 3
+  seconds. `d3-talk-fast:` took 39 questions and about 6 seconds. Before
+  the sweep read lines and a sentence stopped at its best ending, the same
+  messages took 142 questions and 18 seconds; a second model graded the
+  replies of both no differently.
+- Short factual questions come out well ("It is Paris.", "I'm fine
+  today."). Open questions give vaguer sentences, and a sentence can end
+  unfinished. The wording changes from run to run. The sweep by lines
+  misses an answer word that reading every word finds for one test
+  question in 24: "What is two plus two?" now gets "I calculate that."
+  where it got "It's four that is."
 - Against ten reference replies the model picked the reference's next word
   30% of the time from one list of 40 choices, and 40% of the time (65%
   within its top three) from three small groups with a final. Asking it for

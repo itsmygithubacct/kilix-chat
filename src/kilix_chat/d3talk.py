@@ -5,18 +5,20 @@ They only answer questions about text: yes or no, one of these choices, or a
 score. d3-talk turns that into a reply by always handing the model a list of
 choices, most-used first.
 
-  think    The most-used words are swept in frequency order, a group at a
-           time, and the model picks the ones a good answer would name.
-           The survivors are the topic words.
+  think    The most-used words are swept in frequency order. The model first
+           picks, from lines of ten, the lines that hold a word a good
+           answer would name, and then picks those words from the best
+           lines. The survivors are the topic words.
   compose  The reply grows one word at a time. Each step offers three groups
            of choices: the words that most often follow the last word, the
            most-used grammar words, and the topic words. The group winners
            meet in a final. A sentence has to open on a grammar word, or it
            reads like a headline.
-  compare  Several partial replies are kept alive at once. After every word
-           the model ranks them as whole sentences, which it does far better
-           than it picks single words. A second sentence is kept only if the
-           model prefers the reply with it.
+  compare  Two partial replies are kept alive at once. After every word the
+           model ranks them as whole sentences, which it does far better
+           than it picks single words, and a sentence is done as soon as the
+           best one has ended. A second sentence is kept only if the model
+           prefers the reply with it.
   learn    Every word of the finished reply is counted with the word before
            it. Pairs the model uses often are offered earlier next time.
 
@@ -29,6 +31,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import functools
+import math
 import os
 from pathlib import Path
 import re
@@ -53,8 +56,10 @@ STOPS = ".?!"
 PUNCT = ".,?!"
 UNIGRAMS_READ = 60000      # lines of count_1w.txt to read
 GROUP = 14                 # choices per question while composing
-SWEEP_GROUP = 100          # words per question in the topic sweep
-SWEEP_KEEP = 5             # words that survive each of those questions
+SWEEP_LINE = 10            # words on a line in the topic sweep's first pass
+SWEEP_GROUP = 100          # lines, then words, per question in the topic sweep
+SWEEP_WORDS = 320          # words that go on from the best lines to the second pass
+SWEEP_KEEP = 12            # words that survive each question of the second pass
 HISTORY_CHARS = 1200       # earlier turns repeated in every question
 NOTES_CHARS = 400          # system prompt and memory repeated in every question
 
@@ -97,6 +102,8 @@ CONTRACTIONS = {
 VOICE = 'The assistant calls itself "I" and calls the user "you".'
 TOPIC_QUESTION = ("Which of these words is most likely one of the specific things, facts or details named in "
                   "that answer?")
+LINE_QUESTION = ("Which of these lines holds a word that is most likely one of the specific things, facts or "
+                 "details named in that answer?")
 STEP_QUESTION = "Which option continues the reply with correct English grammar and good sense?"
 BEGINNING_QUESTION = ("Which option is the best beginning of a full spoken sentence, with a subject and a verb, "
                       "that answers the user correctly? It must not read like a title or heading.")
@@ -310,7 +317,7 @@ def split(messages):
 
 @dataclass
 class Settings:
-    beam: int = 3            # partial replies kept alive at once
+    beam: int = 2            # partial replies kept alive at once
     sentences: int = 2       # most sentences in a reply
     max_words: int = 20      # most words in a sentence
     vocab: int = 4000        # most-used words swept for topic words; 0 skips the sweep
@@ -374,22 +381,33 @@ class Talker:
         state = (context + "\nA knowledgeable assistant answers directly in one sentence, giving the actual "
                  "answer and its specific details.")
         candidates = [word for word in lexicon.words[:settings.vocab] if len(word) > 2 and word not in GRAMMAR]
-        # Round one: frequency order, a group at a time, a few survive each.
+
+        def progress(picked, earlier):
+            if self.on_text:    # the newest picks first: the line may be cut short
+                self.on_text("(choosing topic words) " + " ".join((picked + earlier[::-1])[:24]))
+
+        # Pass one: whole lines of words, in frequency order. A line costs a
+        # quarter of what its words cost one by one, and most lines hold nothing.
+        lines = [" ".join(candidates[start:start + SWEEP_LINE]) for start in range(0, len(candidates), SWEEP_LINE)]
+        share = math.ceil(SWEEP_WORDS / SWEEP_LINE / math.ceil(len(lines) / SWEEP_GROUP)) if lines else 0
+        if len(lines) > share:
+            kept = []
+            for start in range(0, len(lines), SWEEP_GROUP):
+                ranked = self.choose(state, LINE_QUESTION, dict.fromkeys(lines[start:start + SWEEP_GROUP], ""))
+                picked = [line for line, _ in ranked[:share]]
+                progress(" ".join(picked).split(), " ".join(kept).split())
+                kept += picked
+            candidates = " ".join(kept).split()
+        # Pass two: the words of the best lines, a group at a time, then a final.
         survivors = []
         for start in range(0, len(candidates), SWEEP_GROUP):
-            group = candidates[start:start + SWEEP_GROUP]
-            ranked = self.choose(state, TOPIC_QUESTION, dict.fromkeys(group, ""))
+            ranked = self.choose(state, TOPIC_QUESTION, dict.fromkeys(candidates[start:start + SWEEP_GROUP], ""))
             picked = [word for word, _ in ranked[:SWEEP_KEEP]]
-            if self.on_text:    # the newest picks first: the line may be cut short
-                self.on_text("(choosing topic words) " + " ".join(picked + survivors[::-1][:24]))
+            progress(picked, survivors)
             survivors += picked
-        # Round two: the survivors against each other, then a final.
-        score = {}
-        for start in range(0, len(survivors), 60):
-            for word, odds in self.choose(state, TOPIC_QUESTION, dict.fromkeys(survivors[start:start + 60], ""))[:12]:
-                score[word] = odds
-        finalists = sorted(score, key=lambda word: -score[word])[:48]
-        found = [word for word, _ in self.choose(state, TOPIC_QUESTION, dict.fromkeys(finalists, ""))]
+        found = survivors[:48]
+        if len(found) > 1:
+            found = [word for word, _ in self.choose(state, TOPIC_QUESTION, dict.fromkeys(found, ""))]
         found = found[:settings.topics]
         self.detail("topic words: " + " ".join(found))
         return found + [word for word in asked if word not in found]
@@ -476,7 +494,8 @@ class Talker:
                 (finished if beam[-1][0] in STOPS else beams).append(beam)
             if self.on_text:
                 self.on_text(self.show([word for word, _ in kept[0]]))
-            if not beams:
+            # The best candidate has ended: writing on from the others rarely beats it.
+            if not beams or kept[0][-1][0] in STOPS:
                 break
         # Out of words: close what there is.
         return finished or [beam + [(".", 0.0)] for beam in beams]
@@ -528,10 +547,14 @@ class D3TalkModel(ollama.OllamaModel):
     """A decision model that kilix-chat talks with like any other model."""
     architecture = "d3-talk"
 
+    def __init__(self, name, *, fast=False):
+        super().__init__(name)
+        self.settings = Settings(beam=1) if fast else Settings()
+
     def chat(self, messages, *, max_tokens=256, on_text=None, cancel=None):
         started = time.monotonic()
         notes, turns, message = split(messages)
-        talker = Talker(self.name, lexicon(), on_text=on_text, cancel=cancel)
+        talker = Talker(self.name, lexicon(), self.settings, on_text=on_text, cancel=cancel)
         text = talker.reply(message, turns[-3:], notes, max_words=max_tokens)
         return Reply(text, time.monotonic() - started, talker.tokens, len(talker.words))
 
@@ -557,8 +580,10 @@ def main(argv=None):
         epilog="With no message it reads messages from the terminal, one per line, as one conversation.")
     parser.add_argument("message", nargs="*", help="what to say to the model")
     parser.add_argument("-m", "--model", default="d3:2b", help="decision model to speak with (default: d3:2b)")
-    parser.add_argument("-b", "--beam", type=int, default=3, metavar="N",
-                        help="partial replies kept alive at once; 1 is fastest and much worse (default: 3)")
+    parser.add_argument("-b", "--beam", type=int, default=2, metavar="N",
+                        help="partial replies kept alive at once (default: 2)")
+    parser.add_argument("--fast", action="store_true",
+                        help="keep one partial reply: a third less waiting, and vaguer answers")
     parser.add_argument("-s", "--sentences", type=int, default=2, metavar="N",
                         help="most sentences in a reply (default: 2)")
     parser.add_argument("--max-words", type=int, default=20, metavar="N",
@@ -577,7 +602,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if min(args.beam, args.sentences, args.max_words) < 1:
         parser.error("--beam, --sentences and --max-words must be at least 1")
-    settings = Settings(args.beam, args.sentences, args.max_words, args.vocab, args.topics, args.judge,
+    settings = Settings(1 if args.fast else args.beam, args.sentences, args.max_words, args.vocab, args.topics, args.judge,
                         not args.no_learn)
     live = sys.stderr.isatty() and not args.show
     drawn = False

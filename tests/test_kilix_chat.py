@@ -938,7 +938,7 @@ class D3TalkTest(Fixture):
                 asked.append((self.path, body))
                 options = body["questions"]["q"]["criteria"]
                 def weight(key, text):
-                    if key in ("finished", "paris") and (key == "finished" or not text):
+                    if key == "finished" or (not text and "paris" in key.split()):
                         return 50       # stop after one sentence; "paris" is the topic word
                     shown = text.removesuffix(" ...")
                     return 1 + 10 * len(shown) if shown and test.wanted.startswith(shown) else 1
@@ -1009,6 +1009,35 @@ class D3TalkTest(Fixture):
                          "I'm in Paris. It is an apple, a city")
         self.assertEqual(talker.step_options(["it", "is"], ["paris", "."]), {"paris": "It is Paris ...", ".": "It is."})
 
+    def test_the_sweep_reads_lines_first_and_a_sentence_stops_at_its_best_ending(self):
+        with patch.object(d3talk, "SWEEP_LINE", 2), patch.object(d3talk, "SWEEP_WORDS", 2):
+            topics = d3talk.Talker("d3:2b", d3talk.lexicon()).think("Which city?", 'The user said: "Which city?"')
+        first, second = (body["questions"]["q"] for _, body in self.asked[:2])
+        self.assertEqual((first["instructions"], list(first["criteria"])),
+                         (d3talk.LINE_QUESTION, ["capital france", "paris city", "apple"]))
+        self.assertEqual((second["instructions"], list(second["criteria"])),
+                         (d3talk.TOPIC_QUESTION, ["paris", "city"]))      # only the best line's words go on
+        self.assertEqual(topics, ["paris", "city"])
+
+        def composing():
+            """(the most words any offered continuation had, how often partial replies were ranked)"""
+            asked = [body["questions"]["q"] for _, body in self.asked]
+            del self.asked[:]
+            return (max(len(text.removesuffix(" ...").split()) for question in asked
+                        if question["instructions"] in (d3talk.STEP_QUESTION, d3talk.BEGINNING_QUESTION)
+                        for text in question["criteria"].values()),
+                    sum(question["instructions"] == d3talk.BEGINNING_QUESTION for question in asked))
+        del self.asked[:]
+        question = [{"role": "user", "content": "What is the capital of France?"}]
+        reply, _ = models.Model("d3-talk:d3:2b").reply(question, max_tokens=6)
+        longest, ranked = composing()
+        # two partial replies were ranked after every word, and none was written on past "It is Paris."
+        self.assertEqual((reply.text, longest, ranked), (self.wanted, 4, 4))
+        fast = models.Model("d3-talk-fast:d3:2b")
+        self.assertEqual((fast.name, fast.kind), ("d3:2b", "d3-talk"))
+        reply, _ = fast.reply(question, max_tokens=6)
+        self.assertEqual((reply.text, composing()), (self.wanted, (4, 0)))     # one partial reply: nothing to rank
+
     def test_stopping_and_missing_pieces_are_reported(self):
         cancel = threading.Event()
         cancel.set()
@@ -1046,6 +1075,13 @@ class D3TalkTest(Fixture):
         self.assertEqual((chatted.returncode, chatted.stdout), (0, self.wanted + "\n"))
         self.assertIn("topic words: paris", chatted.stderr)
         self.assertIn("4 words from", chatted.stderr)
+        questions = []
+        for flags in ([], ["--fast"]):
+            ran = subprocess.run(talk + ["-v"] + flags + ["What is the capital of France?"], capture_output=True,
+                                 text=True, timeout=60)
+            self.assertEqual((ran.returncode, ran.stdout), (0, self.wanted + "\n"))
+            questions.append(int(ran.stderr.rsplit(" words from ", 1)[1].split()[0]))
+        self.assertLess(questions[1], questions[0])        # --fast keeps one partial reply
         learned = subprocess.run([PROJECT / "d3-talk", "--usage"], capture_output=True, text=True, timeout=60)
         self.assertIn("is\tparis\t1\t", learned.stdout)       # from `ask`; --no-learn added nothing
         self.assertEqual(len(learned.stdout.splitlines()), 5)

@@ -8,6 +8,7 @@ from kilix_chat import d3talk, diffusion, ollama, prompt
 
 OLLAMA_PREFIX = "ollama:"
 D3TALK_PREFIX = "d3-talk:"
+D3TALK_FAST_PREFIX = "d3-talk-fast:"    # one partial reply instead of two
 
 
 def catalog():
@@ -66,6 +67,8 @@ class Model:
             self.backend = ollama.OllamaModel(spec[len(OLLAMA_PREFIX):])
         elif spec.startswith(D3TALK_PREFIX):
             self.backend = d3talk.D3TalkModel(spec[len(D3TALK_PREFIX):])
+        elif spec.startswith(D3TALK_FAST_PREFIX):
+            self.backend = d3talk.D3TalkModel(spec[len(D3TALK_FAST_PREFIX):], fast=True)
         else:
             self.backend = diffusion.DiffusionModel(spec, device=device)
         self.name = self.backend.name

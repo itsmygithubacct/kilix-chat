@@ -363,7 +363,12 @@ What to expect, measured 2026-11-23 with `d3:2b` (Q8_0) on a Quadro RTX
 answers in two dialects on one port, one request at a time.
 
 OpenAI, for coding agents: `GET /health`, `GET /v1/models` and
-`POST /v1/chat/completions`, streamed or not. Offered tools are described in
+`POST /v1/chat/completions`, streamed or not. A stream sends its headers at
+once and a `: keepalive` comment every 5 seconds while the reply is still
+running, so a client read timeout does not give up on a silent reply. A
+client that disconnects stops the reply. A failure before the stream starts
+is HTTP 500. A failure after it has started is a `data` line with
+`error.message`. Offered tools are described in
 the system prompt. The model calls one by replying
 `<tool_call>{"name": ..., "arguments": {...}}</tool_call>`, which becomes an
 OpenAI `tool_calls` entry. Calls to tools that were not offered are ignored.

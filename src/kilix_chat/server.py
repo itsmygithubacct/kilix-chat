@@ -26,9 +26,10 @@ import uuid
 from kilix_chat import __version__
 from kilix_chat.diffusion import Cancelled
 
-# A diffusion reply has no text until it is finished. While it denoises, an
-# Ollama stream carries an empty message this often, so a client's read
-# timeout (Kilix Avatar's is 120 s) does not end the reply.
+# A diffusion or d3-talk reply has no text until it is finished. While it
+# runs, an Ollama stream carries an empty message, and an OpenAI stream an
+# SSE comment, this often, so a client's read timeout (Kilix Avatar's is
+# 120 s) does not end the reply.
 KEEPALIVE_SECONDS = 5.0
 
 
@@ -190,25 +191,61 @@ def make_handler(model, alias, max_tokens_cap, log):
             except (TypeError, ValueError):
                 self.send_json(400, {"error": {"message": "Bad request (max_tokens must be a number)."}})
                 return
-            try:
-                with lock:
-                    reply, calls = model.reply(messages, tools=body.get("tools"), max_tokens=tokens)
-            except (RuntimeError, ValueError, OSError, Cancelled) as error:
-                self.send_json(500, {"error": {"message": str(error)}})
-                return
+            cancel = threading.Event()
+            result = {}
+
+            def work():
+                try:
+                    with lock:
+                        if not cancel.is_set():
+                            result["reply"] = model.reply(messages, tools=body.get("tools"),
+                                                          max_tokens=tokens, cancel=cancel)
+                except (RuntimeError, ValueError, OSError, Cancelled) as error:
+                    result["error"] = str(error) or type(error).__name__
+                except Exception as error:   # a bug still answers the client, never drops it
+                    result["error"] = f"kilix-chat failed: {type(error).__name__}: {error}"
+                    if log:
+                        log(result["error"])
+
+            worker = threading.Thread(target=work, daemon=True)
+            worker.start()
             if not body.get("stream"):
+                worker.join()
+                if "error" in result:
+                    self.send_json(500, {"error": {"message": result["error"]}})
+                    return
+                reply, calls = result["reply"]
                 self.send_json(200, completion(alias, reply, calls))
                 return
+            # Headers go out before the reply exists. A client that sees
+            # silence for 30 s otherwise treats the socket as closed.
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "close")
             self.end_headers()
-            for part in chunks(alias, reply, calls):
-                self.wfile.write(b"data: " + json.dumps(part).encode() + b"\n\n")
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
             self.close_connection = True
+            try:
+                while True:
+                    worker.join(KEEPALIVE_SECONDS)
+                    if not worker.is_alive():
+                        break
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                if "error" in result:
+                    payload = json.dumps({"error": {"message": result["error"]}}).encode()
+                    self.wfile.write(b"data: " + payload + b"\n\n")
+                    self.wfile.flush()
+                    return
+                reply, calls = result["reply"]
+                for part in chunks(alias, reply, calls):
+                    self.wfile.write(b"data: " + json.dumps(part).encode() + b"\n\n")
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, socket.timeout):
+                # The client left: stop the reply rather than finish it unseen.
+                cancel.set()
+                worker.join()
 
         def ollama_model(self, body):
             """The requested name if it is the served model, else None after answering."""

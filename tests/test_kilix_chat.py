@@ -324,6 +324,47 @@ class ServerTest(Served):
         self.assertEqual(events[-1]["choices"][0]["finish_reason"], "tool_calls")
         self.assertIn("<tool_call>", self.runs()[0][1])
 
+    def test_a_slow_reply_keeps_the_stream_alive_and_a_failure_is_an_error_event(self):
+        os.environ["CHAT_SLEEP"] = "0.6"
+        url = self.start()
+        with patch.object(server, "KEEPALIVE_SECONDS", 0.1):
+            text = self.post(url, {"stream": True, "messages": [{"role": "user", "content": "hi"}]})
+        self.assertGreaterEqual(text.count(": keepalive"), 3)
+        events = [json.loads(line[6:]) for line in text.splitlines() if line.startswith("data: {")]
+        content = "".join(event["choices"][0]["delta"].get("content") or "" for event in events)
+        self.assertIn("Echo: hi", content)
+        self.assertTrue(text.rstrip().endswith("data: [DONE]"))
+        os.environ.update(CHAT_SLEEP="", CHAT_FAIL="1")
+        url = self.start()
+        text = self.post(url, {"stream": True, "messages": [{"role": "user", "content": "x"}]})
+        self.assertIn("failed to load model", text)
+        self.assertNotIn("data: [DONE]", text)
+        with self.assertRaises(Exception) as caught:
+            self.post(url, {"messages": [{"role": "user", "content": "x"}]})
+        self.assertEqual(caught.exception.code, 500)
+
+    def test_a_client_that_leaves_stops_the_openai_reply(self):
+        os.environ["CHAT_SLEEP"] = "3"
+        url = self.start()
+        body = json.dumps({"stream": True, "messages": [{"role": "user", "content": "x"}]}).encode()
+        with patch.object(server, "KEEPALIVE_SECONDS", 0.05):
+            client = socket.create_connection(("127.0.0.1", int(url.rsplit(":", 1)[1])), timeout=10)
+            client.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                           + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+            received = b""
+            while b": keepalive" not in received:
+                chunk = client.recv(4096)
+                if not chunk:
+                    self.fail(f"the server closed the stream: {received!r}")
+                received += chunk
+            client.close()
+            time.sleep(4)
+        self.assertEqual(len(self.runs()), 1)
+        self.assertFalse(Path(str(self.calls) + ".finished").exists())
+        os.environ["CHAT_SLEEP"] = ""
+        result = json.loads(self.post(url, {"messages": [{"role": "user", "content": "hi"}]}))
+        self.assertEqual(result["choices"][0]["message"]["content"], "Echo: hi")
+
     def test_model_errors_are_http_500(self):
         os.environ["CHAT_FAIL"] = "1"
         url = self.start()

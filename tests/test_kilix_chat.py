@@ -1288,6 +1288,123 @@ class D3TalkTest(Fixture):
         chat.worker.join(30)
         self.assertEqual([m["content"] for m in chat.messages], ["What is the capital of France?", self.wanted])
 
+    def _talker(self):
+        talker = d3talk.Talker("d3:2b", d3talk.lexicon(), d3talk.Settings(unit="words", learn=False, vocab=0))
+        return talker
+
+    def test_a_greeting_with_tools_is_answered_in_words(self):
+        model = models.Model("d3-talk-words:d3:2b")
+        model.backend.settings.learn = False
+        tools = [{"type": "function", "function": {
+            "name": "write", "description": "Write a file.",
+            "parameters": {"type": "object", "required": ["path", "content"],
+                           "properties": {"path": {"type": "string"}, "content": {"type": "string"}}}}}]
+        reply, calls = model.reply([{"role": "user", "content": "hi"}], tools=tools, max_tokens=6)
+        self.assertEqual((reply.text, calls), (self.wanted, []))
+
+    def test_ollama_still_refuses_a_request_that_offers_tools(self):
+        with self.assertRaisesRegex(ValueError, "Tool calls are only offered for diffusion models"):
+            models.Model("ollama:small:v2").reply(
+                [{"role": "user", "content": "hi"}],
+                tools=[{"type": "function", "function": {"name": "read", "parameters": {}}}])
+
+    def test_a_tool_is_called_with_text_the_message_already_contains(self):
+        wanted = self.wanted
+        self.wanted = "Write a file."
+        try:
+            model = models.Model("d3-talk-words:d3:2b")
+            model.backend.settings.learn = False
+            tools = [
+                {"type": "function", "function": {
+                    "name": "read", "description": "Read a file.",
+                    "parameters": {"type": "object", "required": ["path"],
+                                   "properties": {"path": {"type": "string"}}}}},
+                {"type": "function", "function": {
+                    "name": "write", "description": "Write a file.",
+                    "parameters": {"type": "object", "required": ["path", "content"],
+                                   "properties": {"path": {"type": "string"}, "content": {"type": "string"}}}}},
+            ]
+            reply, calls = model.reply(
+                [{"role": "user", "content": 'Write hello_world.txt with "hello world".'}], tools=tools)
+        finally:
+            self.wanted = wanted
+        self.assertEqual(reply.text, "")
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0]["id"].startswith("call_"))
+        self.assertEqual(calls[0]["type"], "function")
+        self.assertEqual(calls[0]["function"]["name"], "write")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
+                         {"path": "hello_world.txt", "content": "hello world"})
+
+    def test_an_edit_uses_the_two_quoted_strings_and_a_relative_path(self):
+        goal = "Get the agent to write Hello, World! to ~/hello_world.txt."
+        self.assertEqual(d3talk.path_candidates(goal), ["hello_world.txt", "~/hello_world.txt"])
+        self.assertEqual(d3talk.text_candidates(goal, "content")[0], "Hello, World!")
+        wanted = self.wanted
+        self.wanted = "Edit one spot."
+        try:
+            tools = [{"type": "function", "function": {
+                "name": "edit", "description": "Edit one spot.",
+                "parameters": {"type": "object", "required": ["path", "edits"], "properties": {
+                    "path": {"type": "string"},
+                    "edits": {"type": "array", "items": {
+                        "type": "object", "required": ["oldText", "newText"],
+                        "properties": {"oldText": {"type": "string"}, "newText": {"type": "string"}}}}}}}}]
+            call = self._talker().tool_call('Edit hello_world.txt replace "hello" with "goodbye".', (), "", tools)
+        finally:
+            self.wanted = wanted
+        self.assertEqual(json.loads(call["function"]["arguments"]),
+                         {"path": "hello_world.txt", "edits": [{"oldText": "hello", "newText": "goodbye"}]})
+
+    def test_a_tool_with_nothing_to_point_at_is_an_answer_in_words(self):
+        wanted = self.wanted
+        self.wanted = "Write a file."
+        try:
+            before = len(self.asked)
+            call = self._talker().tool_call("please write something", (), "", [{
+                "type": "function", "function": {
+                    "name": "write", "description": "Write a file.",
+                    "parameters": {"type": "object", "required": ["path", "content"],
+                                   "properties": {"path": {"type": "string"}, "content": {"type": "string"}}}}},
+                {"type": "function", "function": {
+                    "name": "count", "description": "Count.",
+                    "parameters": {"type": "object", "required": ["n"], "properties": {"n": {"type": "number"}}}}},
+            ])
+            asked = len(self.asked) - before
+        finally:
+            self.wanted = wanted
+        self.assertIsNone(call)
+        self.assertEqual(asked, 1)          # the tool was chosen, then the missing path declined it
+        numbered = [{"type": "function", "function": {
+            "name": f"tool-{n}", "description": f"Tool number {n}.", "parameters": {}}} for n in range(14)]
+        self.assertEqual([name for name, _, _ in d3talk.offered_tools(numbered)], [f"tool-{n}" for n in range(13)])
+        before = len(self.asked)
+        self.wanted = "Tool number 13."
+        try:
+            self.assertIsNone(self._talker().tool_call("use it", (), "", numbered))
+        finally:
+            self.wanted = wanted
+        self.assertEqual(len(self.asked), before + 1)   # the fourteenth tool is not offered, so no call
+
+    def test_a_tool_result_is_something_d3_talk_can_answer(self):
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"function": {"name": "write", "arguments": "{}"}}]},
+            {"role": "tool", "name": "write", "content": "wrote hello_world.txt"},
+        ]
+        self.assertEqual(d3talk.split(messages),
+                         ("", [("hi", "Called write.")], "Tool result (write): wrote hello_world.txt"))
+        model = models.Model("d3-talk-words:d3:2b")
+        model.backend.settings.learn = False
+        reply, calls = model.reply(messages, tools=[{
+            "type": "function", "function": {
+                "name": "write", "description": "Write a file.",
+                "parameters": {"type": "object", "required": ["path", "content"],
+                               "properties": {"path": {"type": "string"}, "content": {"type": "string"}}}}}],
+            max_tokens=6)
+        self.assertEqual((reply.text, calls), (self.wanted, []))
+
 
 if __name__ == "__main__":
     unittest.main()

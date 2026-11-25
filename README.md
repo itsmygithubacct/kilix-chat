@@ -226,8 +226,11 @@ characters, and so are the last three exchanges.
 `kilix-chat --model d3-talk:d3:2b serve` serves it like any other model,
 so OpenAI and Ollama clients can chat with a decision model. The reported
 prompt tokens add up every question's prompt: about 17,000 for the reply
-"It is Paris." A request that offers tools is refused, as it is for an
-Ollama model.
+"It is Paris." A request that offers tools asks d3 whether the latest
+message needs one tool or an answer in words. A tool is called only when
+every argument is text already in that message, such as a path or a quoted
+string. A tie is an answer in words, so a greeting does not run a tool.
+An Ollama chat model still refuses a request that offers tools.
 
 The same engine runs on its own as `d3-talk`:
 

@@ -87,9 +87,14 @@ class Model:
     def reply(self, messages, *, tools=None, max_tokens=256, steps=None, on_partial=None, cancel=None):
         """Return (Reply, tool_calls). on_partial(text, step, steps) shows progress."""
         if not self.diffusion:
-            if tools:
+            # d3-talk picks one offered tool, or answers in words. An Ollama
+            # chat model has no such question, so a tool request is refused.
+            if tools and not isinstance(self.backend, d3talk.D3TalkModel):
                 raise ValueError("Tool calls are only offered for diffusion models.")
             text = (lambda t: on_partial(t, None, None)) if on_partial else None
+            if isinstance(self.backend, d3talk.D3TalkModel):
+                return self.backend.respond(messages, tools=tools, max_tokens=max_tokens,
+                                            on_text=text, cancel=cancel)
             return self.backend.chat(messages, max_tokens=max_tokens, on_text=text, cancel=cancel), []
         frame = (lambda step, total, t: on_partial(t, step, total)) if on_partial else None
         history = list(messages)

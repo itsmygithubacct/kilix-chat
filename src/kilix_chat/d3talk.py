@@ -33,6 +33,12 @@ with a hyphen after it ("It is Par-"). Mixed graded the same as words on the
 30-message set. A fresh, larger blind set is still needed before treating
 mixed as the better unit.
 
+When a request offers tools, d3 is asked whether the latest message needs
+one tool or an answer in words. A tool is called only when every argument
+is text already in that message. A tie goes to the answer in words, so a
+greeting does not run a tool. An argument d3 cannot point at is left
+uncalled and the reply is words.
+
 Word and word-pair frequencies come from Peter Norvig's lists
 (norvig.com/ngrams). They are downloaded once, on first use, into
 `$XDG_DATA_HOME/kilix-chat/d3-talk/`, where the learned usage is kept too.
@@ -45,6 +51,7 @@ from dataclasses import dataclass
 import functools
 import itertools
 from http.client import HTTPException
+import json
 import math
 import os
 from pathlib import Path
@@ -53,6 +60,7 @@ import shutil
 import sys
 import tempfile
 import time
+import uuid
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
@@ -87,6 +95,9 @@ TOPIC_WEIGHT = 0.05        # how much likelier the best topic word's letters and
 WORD_WEIGHT = 0.1          # how much likelier the words the word unit would offer are spelled
 TOKEN_CHOICES = 3 * GROUP - 2  # most tokens offered at one step (a word can open on thousands), as many as words
 NOTES_CHARS = 400          # system prompt and memory repeated in every question
+NO_TOOL = "no-tool"        # the choice to answer in words; not a tool name
+NONE = "none"              # the choice that an argument is none of the spans
+COMMAND_FIELDS = frozenset({"command", "cmd"})
 
 # First words of a sentence, most-used first. The corpus is web text and its
 # sentence starts are poor, so these seed the list until usage reorders it.
@@ -512,7 +523,8 @@ def split(messages):
     """(notes, earlier turns, the message to answer) from a conversation.
 
     The notes are the system messages. The earlier turns are (user, assistant)
-    pairs, oldest first."""
+    pairs, oldest first. A tool result is part of what to answer next, so a
+    coding agent can continue after a call without a new user message."""
     notes, turns, said = [], [], None
     for message in messages:
         role, text = message.get("role"), text_of(message.get("content")).strip()
@@ -522,11 +534,151 @@ def split(messages):
             # Two user messages in a row are one thing to answer.
             said = f"{said}\n{text}" if said else text
         elif role == "assistant" and said is not None:
+            calls = []
+            for call in message.get("tool_calls") or []:
+                function = call.get("function") if isinstance(call, dict) else None
+                name = function.get("name") if isinstance(function, dict) else None
+                if isinstance(name, str) and name:
+                    calls.append(name)
+            if calls:
+                text = (text + "\n" if text else "") + "Called " + ", ".join(calls) + "."
             turns.append((said, text))
             said = None
+        elif role == "tool":
+            name = message.get("name") or message.get("tool_name") or "tool"
+            if not isinstance(name, str) or not name:
+                name = "tool"
+            result = f"Tool result ({name}): {text}" if text else f"Tool result ({name}):"
+            said = f"{said}\n{result}" if said else result
     if not said:
         raise ValueError("d3-talk needs a message from the user to answer.")
     return "\n".join(note for note in notes if note), turns, said
+
+
+_QUOTE = re.compile(r'"([^"\n]{1,200})"|\'([^\'\n]{1,200})\'|`([^`\n]{1,200})`')
+_PATH = re.compile(r"(?:~|\.{1,2}/|/)[\w./~-]+|[\w.-]+\.[A-Za-z0-9]{1,8}")
+_PHRASE = re.compile(r"[A-Z][A-Za-z]*(?:,[ \t]*[A-Za-z]+)*!")
+
+
+def _path_name(name):
+    return name == "path" or name.endswith("_path") or name in {"file", "filename", "filepath"}
+
+
+def argument_fields(schema):
+    """Required arguments d3 can fill, or None when one of them is not text.
+
+    A string is one value. An array of objects whose own required fields are
+    strings is one such object. A number or a nested array cannot be pointed
+    at in the message, so that tool is not offered.
+    """
+    if not schema:
+        return []
+    if not isinstance(schema, dict):
+        return None
+    props = schema.get("properties") or {}
+    required = schema.get("required") or []
+    if not isinstance(props, dict) or not isinstance(required, list):
+        return None
+    fields = []
+    for name in required:
+        prop = props.get(name) if isinstance(name, str) else None
+        if not isinstance(prop, dict):
+            return None
+        kind = prop.get("type")
+        if kind == "string":
+            fields.append((name, "path" if _path_name(name) else "text"))
+        elif kind == "array":
+            items = prop.get("items")
+            if not isinstance(items, dict) or items.get("type") != "object":
+                return None
+            inner = argument_fields(items)
+            if not inner or any(not isinstance(kind, str) for _, kind in inner):
+                return None
+            fields.append((name, ("list", inner)))
+        else:
+            return None
+    return fields
+
+
+def offered_tools(tools):
+    """(name, short description, fields) for the tools d3 can call.
+
+    At most thirteen: one question also offers an answer in words, and a
+    question holds GROUP choices."""
+    ready = []
+    for tool in tools or []:
+        spec = tool.get("function", tool) if isinstance(tool, dict) else None
+        if not isinstance(spec, dict):
+            continue
+        name = spec.get("name")
+        if not isinstance(name, str) or not name or name in (NO_TOOL, NONE):
+            continue
+        fields = argument_fields(spec.get("parameters") or {})
+        if fields is None:
+            continue
+        description = spec.get("description") if isinstance(spec.get("description"), str) else ""
+        description = " ".join(description.split())[:160] or name
+        ready.append((name, description, fields))
+        if len(ready) == GROUP - 1:
+            break
+    return ready
+
+
+def _quoted_and_rest(text):
+    """Quoted spans, and the message with those spans blanked so a path
+    inside quotes is not offered twice."""
+    text = text or ""
+    quoted, chars = [], list(text)
+    for match in _QUOTE.finditer(text):
+        quoted.append(next(group for group in match.groups() if group is not None))
+        for index in range(match.start(), match.end()):
+            chars[index] = " "
+    return quoted, "".join(chars)
+
+
+def _paths(text):
+    """Paths in `text`. A ~/file is also offered as file, and that relative
+    form comes first: the coding agent is asked for a path inside ~."""
+    found = []
+    for match in _PATH.finditer(text or ""):
+        path = match.group(0).strip(".,);")
+        if path.startswith("~/"):
+            relative = path[2:]
+            if relative and relative not in found:
+                found.append(relative)
+        if path and path not in found:
+            found.append(path)
+    relative = [path for path in found if "/" not in path and not path.startswith("~")]
+    return relative + [path for path in found if path not in relative]
+
+
+def path_candidates(text):
+    _quoted, rest = _quoted_and_rest(text)
+    return _paths(rest)[:GROUP - 1]
+
+
+def text_candidates(text, field):
+    """Text the message already contains that could be this argument.
+
+    Quoted strings and a phrase such as "Hello, World!" come before a path
+    or the whole message. A shell command is only a quoted string: the whole
+    message is not something to execute."""
+    quoted, rest = _quoted_and_rest(text)
+    phrases = []
+    for match in _PHRASE.finditer(rest):
+        phrase = match.group(0).strip()
+        if phrase and phrase not in phrases:
+            phrases.append(phrase)
+    paths = [] if field in COMMAND_FIELDS else _paths(rest)
+    ordered = []
+    for item in quoted + phrases + paths:
+        if item not in ordered:
+            ordered.append(item)
+    if field not in COMMAND_FIELDS:
+        whole = " ".join((text or "").split())
+        if whole and whole not in ordered and len(whole) <= 200:
+            ordered.append(whole)
+    return ordered[:GROUP - 1]
 
 
 @dataclass
@@ -1073,6 +1225,56 @@ class Talker:
                 self.detail(f"  could not save what was learned to {self.lexicon.usage_path()}")
         return self.show(self.words)
 
+    def tool_call(self, message, turns, notes, tools):
+        """One OpenAI tool call, or None when the reply should be words.
+
+        d3 cannot write the JSON of a call. It can pick a tool, and it can
+        point at text the message already contains. A tie, or an argument
+        with nothing to point at, is an answer in words.
+        """
+        ready = offered_tools(tools)
+        if not ready:
+            return None
+        context = self.conversation(message, turns, notes)
+        options = {NO_TOOL: "Answer the user in words and call no tool."}
+        fields_of = {}
+        for name, description, fields in ready:
+            options[name] = description
+            fields_of[name] = fields
+        ranked = self.choose(context, "Does the user's latest message need one tool, or an answer in words?",
+                             options)
+        odds = dict(ranked)
+        best = ranked[0][0]
+        if best == NO_TOOL or odds.get(best, 0) <= odds.get(NO_TOOL, 0):
+            return None
+        arguments, used = {}, set()
+        if not self._fill(context, best, fields_of[best], message, arguments, used):
+            return None
+        return {"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                "function": {"name": best, "arguments": json.dumps(arguments, ensure_ascii=False)}}
+
+    def _fill(self, context, tool, fields, message, arguments, used):
+        for name, kind in fields:
+            if isinstance(kind, tuple):
+                item = {}
+                if not self._fill(context, tool, kind[1], message, item, used):
+                    return False
+                arguments[name] = [item]
+                continue
+            pool = path_candidates(message) if kind == "path" else text_candidates(message, name)
+            candidates = [item for item in pool if item not in used]
+            if not candidates:
+                return False
+            options = {str(index): text for index, text in enumerate(candidates)}
+            options[NONE] = "None of these."
+            ranked = self.choose(context, f"Which text is the {name} for the {tool} tool?", options)
+            pick = ranked[0][0]
+            if pick == NONE or pick not in options:
+                return False
+            arguments[name] = options[pick]
+            used.add(options[pick])
+        return True
+
 
 class D3TalkModel(ollama.OllamaModel):
     """A decision model that kilix-chat talks with like any other model."""
@@ -1084,11 +1286,19 @@ class D3TalkModel(ollama.OllamaModel):
         self.settings.unit = unit
 
     def chat(self, messages, *, max_tokens=256, on_text=None, cancel=None):
+        reply, _calls = self.respond(messages, max_tokens=max_tokens, on_text=on_text, cancel=cancel)
+        return reply
+
+    def respond(self, messages, *, tools=None, max_tokens=256, on_text=None, cancel=None):
+        """(Reply, tool calls). A call is empty text plus one tool call."""
         started = time.monotonic()
         notes, turns, message = split(messages)
         talker = Talker(self.name, lexicon(), self.settings, on_text=on_text, cancel=cancel)
+        call = talker.tool_call(message, turns[-3:], notes, tools) if tools else None
+        if call is not None:
+            return Reply("", time.monotonic() - started, talker.tokens, 0), [call]
         text = talker.reply(message, turns[-3:], notes, max_words=max_tokens)
-        return Reply(text, time.monotonic() - started, talker.tokens, len(talker.words))
+        return Reply(text, time.monotonic() - started, talker.tokens, len(talker.words)), []
 
 
 # the d3-talk command

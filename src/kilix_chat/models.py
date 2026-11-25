@@ -9,8 +9,9 @@ from kilix_chat import d3talk, diffusion, ollama, prompt
 OLLAMA_PREFIX = "ollama:"
 D3TALK_PREFIX = "d3-talk:"
 D3TALK_FAST_PREFIX = "d3-talk-fast:"    # one partial reply instead of two
-# d3-talk-tokens:NAME, d3-talk-letters:NAME, d3-talk-mixed:NAME: the unit each choice adds
-D3TALK_UNIT_PREFIXES = {f"d3-talk-{unit}:": unit for unit in d3talk.UNITS if unit != "words"}
+# d3-talk:NAME uses the default unit (mixed). d3-talk-words:NAME, d3-talk-tokens:NAME,
+# d3-talk-letters:NAME and d3-talk-mixed:NAME name the unit.
+D3TALK_UNIT_PREFIXES = {f"d3-talk-{unit}:": unit for unit in d3talk.UNITS}
 
 
 def catalog():

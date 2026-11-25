@@ -248,9 +248,10 @@ final choice, and `--no-learn` leaves the usage counts alone.
 
 ### Words, tokens or letters
 
-`-u`/`--unit` sets what one choice adds to the reply. In kilix-chat the
-model specs `d3-talk-tokens:NAME`, `d3-talk-letters:NAME` and
-`d3-talk-mixed:NAME` open a decision model with that unit.
+`-u`/`--unit` sets what one choice adds to the reply. The default is
+`mixed`. In kilix-chat, `d3-talk:NAME` uses that default. The specs
+`d3-talk-words:NAME`, `d3-talk-tokens:NAME`, `d3-talk-letters:NAME` and
+`d3-talk-mixed:NAME` name the unit.
 
 ```sh
 ./d3-talk --unit letters --show "Hi, I am Zorblat. What is my name?"
@@ -259,7 +260,7 @@ model specs `d3-talk-tokens:NAME`, `d3-talk-letters:NAME` and
 ./kilix-chat --model d3-talk-letters:d3:2b
 ```
 
-- `words` (the default) is everything above.
+- `words` is everything above. `d3-talk --unit words` and `d3-talk-words:NAME` select it.
 - `letters`: each step offers the letters that continue some word from the
   letters chosen so far, and "the word ends here" when they already spell
   one. A letter that leaves only one word to spell finishes it at once.
@@ -290,7 +291,7 @@ reply after every step and `-v` the choices at every step. Only known words
 are learned: a word spelled from your message is never offered later as a
 word.
 
-Words stay the default. Measured 2026-11-24 with `d3:2b` on 30 test
+`mixed` is the default for now. Measured 2026-11-24 with `d3:2b` on 30 test
 messages (replies graded 0-4 for grammar and answering by a second model),
 and on 8 more whose answer repeats a name or number from the message:
 
@@ -301,13 +302,17 @@ and on 8 more whose answer repeats a name or number from the message:
 | letters | 150 | 44,000 | 15 | 0.60 | 5 of 8 |
 | mixed | 93 | 35,000 | 12 | 2.60 | 8 of 8 |
 
-Mixed and tokens reply about as well as words (no difference a sign test
-can tell on 30 messages). In mixed the model takes a whole word 96% of the
-time, and the message's own names are offered whole with the topic words,
-which is why it repeats them ("It's Quexton Kentucky."). Letters are much
-worse: the
-model picks the right next letter about half the time, so it rarely spells
-the word it meant, and replies come out as invented words.
+Mixed and tokens reply about as well as words. On those 30 messages mixed
+was better on 6 and worse on 5 (sign test p = 1.0), so the grades do not
+say mixed is better. That set was also the set the mode was built against.
+A fresh, larger blind set is still needed before treating mixed as the
+better unit. It is the default because it can repeat a name or a number
+from the message, which words cannot. In mixed the model takes a whole
+word 96% of the time, and the message's own names are offered whole with
+the topic words, which is why it repeats them ("It's Quexton Kentucky.").
+Letters are much worse: the model picks the right next letter about half
+the time, so it rarely spells the word it meant, and replies come out as
+invented words.
 
 Word and word-pair frequencies come from Peter Norvig's
 [n-gram lists](https://norvig.com/ngrams/) (`count_1w.txt` and

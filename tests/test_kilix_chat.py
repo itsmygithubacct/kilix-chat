@@ -968,8 +968,13 @@ class D3TalkTest(Fixture):
         self.assertEqual(([key for key, _ in ranked], tokens), (["b", "a"], 7))
         self.assertAlmostEqual(sum(odds for _, odds in ranked), 1.0)
 
+    def test_mixed_is_the_default_and_words_can_still_be_named(self):
+        opened = models.Model("d3-talk:d3:2b")
+        named = models.Model("d3-talk-words:d3:2b")
+        self.assertEqual((opened.backend.settings.unit, named.backend.settings.unit), ("mixed", "words"))
+
     def test_a_reply_is_chosen_word_by_word_and_its_words_are_learned(self):
-        model = models.Model("d3-talk:d3:2b")
+        model = models.Model("d3-talk-words:d3:2b")
         self.assertEqual((model.name, model.kind, model.diffusion), ("d3:2b", "d3-talk", False))
         shown = []
         history = [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Hello"},
@@ -1032,7 +1037,7 @@ class D3TalkTest(Fixture):
                     sum(question["instructions"] == d3talk.BEGINNING_QUESTION for question in asked))
         del self.asked[:]
         question = [{"role": "user", "content": "What is the capital of France?"}]
-        reply, _ = models.Model("d3-talk:d3:2b").reply(question, max_tokens=6)
+        reply, _ = models.Model("d3-talk-words:d3:2b").reply(question, max_tokens=6)
         longest, ranked = composing()
         # two partial replies were ranked after every word, and none was written on past "It is Paris."
         self.assertEqual((reply.text, longest, ranked), (self.wanted, 4, 4))
@@ -1051,7 +1056,7 @@ class D3TalkTest(Fixture):
             models.Model("d3-talk:d3:2b").reply([{"role": "system", "content": "x"}])
         # the reply length is a number of words, and a sentence that runs out of them is closed
         self.wanted = "It is the capital of France."
-        reply, _ = models.Model("d3-talk:d3:2b").reply([{"role": "user", "content": "And Paris?"}], max_tokens=3)
+        reply, _ = models.Model("d3-talk-words:d3:2b").reply([{"role": "user", "content": "And Paris?"}], max_tokens=3)
         self.assertEqual(reply.text, "It is the.")
         with patch.dict(os.environ, OLLAMA_HOST="127.0.0.1:9"), self.assertRaisesRegex(RuntimeError, "reach Ollama"):
             ollama.decide("d3:2b", "s", "q", {"a": ""})
@@ -1094,7 +1099,8 @@ class D3TalkTest(Fixture):
         usage.unlink()
         usage.mkdir()
         lines = []
-        talker = d3talk.Talker("d3:2b", d3talk.lexicon(), on_detail=lines.append)
+        talker = d3talk.Talker("d3:2b", d3talk.lexicon(), d3talk.Settings(unit="words"),
+                               on_detail=lines.append)
         self.assertEqual(talker.reply("What is the capital of France?", max_words=6), self.wanted)
         self.assertTrue(any(line.strip().startswith("could not save what was learned") for line in lines))
         self.assertEqual(sorted(path.name for path in self.data.iterdir()),
@@ -1197,7 +1203,7 @@ class D3TalkTest(Fixture):
     def test_the_messages_own_words_can_be_spelled_but_are_not_learned(self):
         self.wanted = "It is Zorblat."
         message = [{"role": "user", "content": "I am Zorblat. Who am I?"}]
-        words, _ = models.Model("d3-talk:d3:2b").reply(message, max_tokens=6)
+        words, _ = models.Model("d3-talk-words:d3:2b").reply(message, max_tokens=6)
         self.assertNotEqual(words.text, self.wanted)        # no word list holds it
         (self.data / "usage.tsv").unlink()
         shown = []
@@ -1246,7 +1252,7 @@ class D3TalkTest(Fixture):
         asked = subprocess.run([PROJECT / "kilix-chat", "--model", "d3-talk:d3:2b", "--max-tokens", "6", "ask",
                                 "What is the capital of France?"], capture_output=True, text=True, timeout=60)
         self.assertEqual((asked.returncode, asked.stdout), (0, self.wanted + "\n"))
-        talk = [PROJECT / "d3-talk", "--max-words", "6", "--no-learn"]
+        talk = [PROJECT / "d3-talk", "--unit", "words", "--max-words", "6", "--no-learn"]
         shown = subprocess.run(talk + ["--show", "What", "is", "the", "capital", "of", "France?"],
                                capture_output=True, text=True, timeout=60)
         self.assertEqual((shown.returncode, shown.stdout.splitlines()[:4], shown.stdout.splitlines()[-1]),

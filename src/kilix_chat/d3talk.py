@@ -22,13 +22,16 @@ choices, most-used first.
   learn    Every word of the finished reply is counted with the word before
            it. Pairs the model uses often are offered earlier next time.
 
-The unit of choice is a setting. Words are the default. With letters, each
-step picks the next letter of the word being written, or that the word ends
-there; with tokens, the next piece of the word as d3's own tokenizer cuts it.
-Both offer only what continues some word of the lexicon or of the user's
-message, so a name or a number from the message can be spelled. The mixed
-unit offers whole words, tokens and letters together at every step. An
-unfinished word is shown to the model with a hyphen after it ("It is Par-").
+The unit of choice is a setting. Mixed is the default for now: each step
+offers a whole word, the next token, or the next letter together. Words,
+tokens or letters can still be selected on their own. Letters pick the next
+letter of the word being written, or that the word ends there; tokens pick
+the next piece as d3's own tokenizer cuts it. Both offer only what continues
+some word of the lexicon or of the user's message, so a name or a number
+from the message can be spelled. An unfinished word is shown to the model
+with a hyphen after it ("It is Par-"). Mixed graded the same as words on the
+30-message set. A fresh, larger blind set is still needed before treating
+mixed as the better unit.
 
 Word and word-pair frequencies come from Peter Norvig's lists
 (norvig.com/ngrams). They are downloaded once, on first use, into
@@ -535,7 +538,7 @@ class Settings:
     topics: int = 24         # topic words kept from the sweep
     judge: str | None = None  # a larger decision model that picks the final reply
     learn: bool = True       # count the words of every finished reply
-    unit: str = "words"      # what one choice adds: words, tokens, letters or mixed
+    unit: str = "mixed"      # what one choice adds: words, tokens, letters or mixed
     any_letter: bool = False  # also offer letters that continue no known word
 
 
@@ -1075,7 +1078,7 @@ class D3TalkModel(ollama.OllamaModel):
     """A decision model that kilix-chat talks with like any other model."""
     architecture = "d3-talk"
 
-    def __init__(self, name, *, fast=False, unit="words"):
+    def __init__(self, name, *, fast=False, unit="mixed"):
         super().__init__(name)
         self.settings = Settings(beam=1) if fast else Settings()
         self.settings.unit = unit
@@ -1105,7 +1108,7 @@ def usage_report(lexicon, limit=40):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        prog="d3-talk", description="Let an Ollama decision model speak, one chosen word at a time.",
+        prog="d3-talk", description="Let an Ollama decision model speak, one choice at a time.",
         epilog="With no message it reads messages from the terminal, one per line, as one conversation.")
     parser.add_argument("message", nargs="*", help="what to say to the model")
     parser.add_argument("-m", "--model", default="d3:2b", help="decision model to speak with (default: d3:2b)")
@@ -1122,9 +1125,9 @@ def main(argv=None):
     parser.add_argument("--topics", type=int, default=24, metavar="N",
                         help="topic words kept from the sweep (default: 24)")
     parser.add_argument("--judge", metavar="MODEL", help="a larger decision model that picks the final reply")
-    parser.add_argument("-u", "--unit", choices=UNITS, default="words",
+    parser.add_argument("-u", "--unit", choices=UNITS, default="mixed",
                         help="what one choice adds: a word, a token of d3's tokenizer, a letter, or any of the "
-                             "three (default: words)")
+                             "three (default: mixed)")
     parser.add_argument("--any-letter", action="store_true",
                         help="with --unit letters or mixed, also offer letters that continue no known word")
     parser.add_argument("--no-learn", action="store_true", help="do not count the words used")
